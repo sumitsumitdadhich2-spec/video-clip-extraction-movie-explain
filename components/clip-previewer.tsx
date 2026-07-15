@@ -1,74 +1,69 @@
-'use client'
+"use client"
+
+import { formatSeconds, type ResolvedClip } from "@/lib/timestamp"
 
 interface ClipPreviewerProps {
-  clips: any[]
+  clips: ResolvedClip[]
 }
 
 export function ClipPreviewer({ clips }: ClipPreviewerProps) {
+  const totalDuration = clips.reduce((sum, c) => sum + c.durationSeconds, 0)
+
   return (
     <div>
-      <h2 className="text-2xl font-bold text-white mb-6">Clips to Extract ({clips.length} total)</h2>
-      
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-h-96 overflow-y-auto">
-        {clips.map((clip, index) => {
-          const startTime = clip.matched_in_movie?.start_timestamp
-          const endTime = clip.matched_in_movie?.end_timestamp
-          const confidence = clip.matched_in_movie?.confidence
-          const duration = clip.short_duration?.duration_seconds
-
-          return (
-            <div key={index} className="bg-slate-700 p-4 rounded-lg border border-slate-600 hover:border-blue-400 transition">
-              <div className="flex items-start justify-between mb-2">
-                <h3 className="text-white font-semibold">{clip.short_video_clip}</h3>
-                <span className="text-xs bg-blue-900 text-blue-300 px-2 py-1 rounded">#{index + 1}</span>
-              </div>
-
-              <div className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Duration:</span>
-                  <span className="text-slate-300 font-mono">{duration?.toFixed(2)}s</span>
-                </div>
-
-                {startTime && endTime && (
-                  <div>
-                    <p className="text-slate-400">Movie Location:</p>
-                    <p className="text-slate-300 font-mono text-xs bg-slate-800 p-2 rounded">
-                      {startTime} → {endTime}
-                    </p>
-                  </div>
-                )}
-
-                {confidence && (
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Match Confidence:</span>
-                    <span className="text-green-400 font-semibold">{confidence}</span>
-                  </div>
-                )}
-
-                {clip.matched_in_movie?.total_matching_frames && (
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">Frames:</span>
-                    <span className="text-slate-300">{clip.matched_in_movie.total_matching_frames}</span>
-                  </div>
-                )}
-
-                {clip.matched_in_movie?.fps_match && (
-                  <div className="flex justify-between">
-                    <span className="text-slate-400">FPS:</span>
-                    <span className="text-slate-300">{clip.matched_in_movie.fps_match}</span>
-                  </div>
-                )}
-              </div>
-            </div>
-          )
-        })}
+      <div className="mb-4 flex flex-wrap gap-4 rounded-lg border border-slate-800 bg-slate-950 p-3 text-sm">
+        <span className="text-slate-400">
+          Total clips: <span className="font-semibold text-slate-100">{clips.length}</span>
+        </span>
+        <span className="text-slate-400">
+          Merged length:{" "}
+          <span className="font-semibold text-slate-100">{formatSeconds(totalDuration)}</span>
+        </span>
       </div>
 
-      <div className="mt-6 p-4 bg-slate-700 rounded-lg border border-slate-600">
-        <p className="text-slate-300 text-sm">
-          <span className="font-semibold text-white">{clips.length}</span> clips will be extracted from the movie and merged into a single video file.
-        </p>
+      <div className="max-h-[480px] overflow-y-auto rounded-lg border border-slate-800">
+        <table className="w-full text-left text-sm">
+          <thead className="sticky top-0 bg-slate-800 text-slate-300">
+            <tr>
+              <th className="px-3 py-2 font-medium">Scene</th>
+              <th className="px-3 py-2 font-medium">Movie start</th>
+              <th className="px-3 py-2 font-medium">Movie end</th>
+              <th className="px-3 py-2 font-medium">Duration</th>
+              <th className="px-3 py-2 font-medium">Confidence</th>
+            </tr>
+          </thead>
+          <tbody>
+            {clips.map((clip) => (
+              <tr
+                key={clip.index}
+                className="border-t border-slate-800 odd:bg-slate-900 even:bg-slate-900/40"
+              >
+                <td className="px-3 py-2 font-medium text-slate-100">{clip.short_video_clip}</td>
+                <td className="px-3 py-2 font-mono text-slate-300">
+                  {clip.matched_in_movie.start_timestamp}
+                  <span className="ml-1 text-xs text-slate-500">
+                    ({formatSeconds(clip.startSeconds)})
+                  </span>
+                </td>
+                <td className="px-3 py-2 font-mono text-slate-300">
+                  {clip.matched_in_movie.end_timestamp}
+                </td>
+                <td className="px-3 py-2 text-slate-300">{formatSeconds(clip.durationSeconds)}</td>
+                <td className="px-3 py-2">
+                  <span className="rounded bg-emerald-500/15 px-2 py-0.5 text-xs font-medium text-emerald-300">
+                    {clip.matched_in_movie.confidence}
+                  </span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
+
+      <p className="mt-3 text-xs text-slate-500">
+        Timestamps are read as MM:SS:FF at {clips[0]?.matched_in_movie.fps_match || 24}fps. Single-frame
+        matches are extended to a short minimum duration so they stay visible in the merged video.
+      </p>
     </div>
   )
 }

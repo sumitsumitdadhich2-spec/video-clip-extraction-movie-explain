@@ -138,15 +138,21 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
       </div>
 
       <div className="bg-slate-700 p-4 rounded-lg">
-        <h3 className="text-slate-200 font-semibold mb-2">Expected JSON Format:</h3>
+        <h3 className="text-slate-200 font-semibold mb-2">Expected JSON Format</h3>
+        <p className="text-xs text-slate-400 mb-2">
+          {"Timestamps use MM:SS:FF (minutes:seconds:frames) at the given fps_match."}
+        </p>
         <pre className="bg-slate-800 p-3 rounded text-xs text-slate-300 overflow-x-auto">
 {`[
   {
     "short_video_clip": "Scene_01",
     "matched_in_movie": {
-      "movie_name": "video.mp4",
+      "movie_name": "1000171613.mp4",
       "start_timestamp": "00:01:16",
-      "end_timestamp": "00:03:03"
+      "end_timestamp": "00:03:03",
+      "confidence": "87.9%",
+      "fps_match": 24,
+      "total_matching_frames": 33
     }
   }
 ]`}
