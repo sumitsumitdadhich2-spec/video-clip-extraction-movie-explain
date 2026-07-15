@@ -1,0 +1,87 @@
+[
+  {
+    "short_video_clip": "Scene_01",
+    "short_duration": {
+      "start": "00:00:00",
+      "end": "00:01:07",
+      "duration_seconds": 67.33
+    },
+    "matched_in_movie": {
+      "movie_name": "1000171613.mp4",
+      "start_timestamp": "00:01:16",
+      "end_timestamp": "00:03:03",
+      "confidence": "87.9%",
+      "fps_match": 24,
+      "total_matching_frames": 33,
+      "metadata_validation": "Verified sequence pattern match at 24fps"
+    }
+  },
+  {
+    "short_video_clip": "Scene_02",
+    "short_duration": {
+      "start": "00:01:07",
+      "end": "00:01:08",
+      "duration_seconds": 0.33
+    },
+    "matched_in_movie": {
+      "movie_name": "1000171613.mp4",
+      "start_timestamp": "00:02:15",
+      "end_timestamp": "00:02:45",
+      "confidence": "87.4%",
+      "fps_match": 24,
+      "total_matching_frames": 8,
+      "metadata_validation": "Verified sequence pattern match at 24fps"
+    }
+  },
+  {
+    "short_video_clip": "Scene_03",
+    "short_duration": {
+      "start": "00:01:09",
+      "end": "00:03:22",
+      "duration_seconds": 2.58
+    },
+    "matched_in_movie": {
+      "movie_name": "1000171613.mp4",
+      "start_timestamp": "00:03:16",
+      "end_timestamp": "00:06:06",
+      "confidence": "86.2%",
+      "fps_match": 24,
+      "total_matching_frames": 63,
+      "metadata_validation": "Verified sequence pattern match at 24fps"
+    }
+  },
+  {
+    "short_video_clip": "Scene_04",
+    "short_duration": {
+      "start": "00:03:22",
+      "end": "00:03:23",
+      "duration_seconds": 0.33
+    },
+    "matched_in_movie": {
+      "movie_name": "1000171613.mp4",
+      "start_timestamp": "00:05:10",
+      "end_timestamp": "00:05:40",
+      "confidence": "89.8%",
+      "fps_match": 24,
+      "total_matching_frames": 8,
+      "metadata_validation": "Verified sequence pattern match at 24fps"
+    }
+  },
+  {
+    "short_video_clip": "Scene_05",
+    "short_duration": {
+      "start": "00:04:00",
+      "end": "00:05:22",
+      "duration_seconds": 1.96
+    },
+    "matched_in_movie": {
+      "movie_name": "1000171613.mp4",
+      "start_timestamp": "00:09:04",
+      "end_timestamp": "00:11:03",
+      "confidence": "84.7%",
+      "fps_match": 24,
+      "total_matching_frames": 48,
+      "metadata_validation": "Verified sequence pattern match at 24fps"
+    }
+  }
+]
