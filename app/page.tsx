@@ -14,21 +14,58 @@ export default function Page() {
   const [clips, setClips] = useState<ResolvedClip[]>([])
   const [step, setStep] = useState<Step>("upload")
   const [parseError, setParseError] = useState<string | null>(null)
+  const [videoSource, setVideoSource] = useState<'short' | 'full'>('full')
 
-  const handleFilesSelected = (video: File, json: File) => {
+  const handleFilesSelected = (video: File, json: File, source: 'short' | 'full') => {
     setParseError(null)
+    setVideoSource(source)
     const reader = new FileReader()
     reader.onload = (e) => {
       try {
         const raw = JSON.parse(e.target?.result as string)
-        const list: Clip[] = Array.isArray(raw) ? raw : raw.clips || raw.scenes || []
+        const list: Clip[] = Array.isArray(raw) ? raw : raw.clips || raw.scenes || raw.segments || []
         if (!list.length) {
-          setParseError("No clips found in the JSON. Expected an array of scenes.")
+          setParseError("No clips found in the JSON. Expected an array of scenes or segments.")
           return
         }
-        const resolved = list
-          .filter((c) => c?.matched_in_movie?.start_timestamp)
-          .map((c, i) => resolveClip(c, i))
+        
+        // Filter based on video source selection
+        let resolved: ResolvedClip[]
+        if (source === 'short') {
+          // For short videos, use short_duration if available
+          resolved = list
+            .filter((c) => c?.short_duration?.start)
+            .map((c, i) => {
+              const shortDuration = c.short_duration!
+              const fps = c.matched_in_movie?.fps_match || 24
+              const startSeconds = resolveClip(
+                {
+                  ...c,
+                  matched_in_movie: {
+                    ...c.matched_in_movie,
+                    start_timestamp: shortDuration.start,
+                    end_timestamp: shortDuration.end,
+                    fps_match: fps,
+                    total_matching_frames: 1
+                  }
+                },
+                i
+              )
+              return startSeconds
+            })
+        } else {
+          // For full movies, use matched_in_movie
+          resolved = list
+            .filter((c) => c?.matched_in_movie?.start_timestamp)
+            .map((c, i) => resolveClip(c, i))
+        }
+        
+        if (!resolved.length) {
+          const fieldName = source === 'short' ? 'short_duration' : 'matched_in_movie'
+          setParseError(`No clips found with ${fieldName} data for ${source === 'short' ? 'short video' : 'full movie'}.`)
+          return
+        }
+        
         setVideoFile(video)
         setClips(resolved)
         setStep("preview")
@@ -98,9 +135,16 @@ export default function Page() {
                   <h2 className="text-lg font-semibold text-slate-100">
                     {clips.length} clips detected
                   </h2>
-                  <p className="text-sm text-slate-400">
-                    Source: <span className="text-slate-300">{videoFile?.name}</span>
-                  </p>
+                  <div className="space-y-1">
+                    <p className="text-sm text-slate-400">
+                      Video: <span className="text-slate-300">{videoFile?.name}</span>
+                    </p>
+                    <p className="text-sm text-slate-400">
+                      Type: <span className={`text-sm font-semibold ${videoSource === 'short' ? 'text-purple-400' : 'text-blue-400'}`}>
+                        {videoSource === 'short' ? '📹 Short Video' : '🎬 Full Movie'}
+                      </span>
+                    </p>
+                  </div>
                 </div>
                 <div className="flex gap-2">
                   <Button
