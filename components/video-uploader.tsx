@@ -227,7 +227,15 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
                 )}
                 {jsonFile && !pasteError && pastedJson && (
                   <p className="text-green-400 text-xs mt-1">
-                    Valid JSON — {JSON.parse(pastedJson).length ?? '?'} clip(s) found
+                    {(() => {
+                      try {
+                        const parsed = JSON.parse(pastedJson)
+                        const count = Array.isArray(parsed) ? parsed.length : parsed.clips?.length || parsed.scenes?.length || parsed.segments?.length || 0
+                        return `Valid JSON — ${count} clip(s) found`
+                      } catch {
+                        return 'Valid JSON'
+                      }
+                    })()}
                   </p>
                 )}
               </>
