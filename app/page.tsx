@@ -29,39 +29,38 @@ export default function Page() {
           return
         }
         
-        // Filter based on video source selection
+        // Filter and map clips based on video source selection
         let resolved: ResolvedClip[]
         if (source === 'short') {
-          // For short videos, use short_duration if available
+          // For short videos, extract clips from shortStart and shortEnd
           resolved = list
-            .filter((c) => c?.short_duration?.start)
+            .filter((c) => c?.shortStart !== undefined && c?.shortEnd !== undefined)
             .map((c, i) => {
-              const shortDuration = c.short_duration!
-              const fps = c.matched_in_movie?.fps_match || 24
-              const startSeconds = resolveClip(
-                {
-                  ...c,
-                  matched_in_movie: {
-                    ...c.matched_in_movie,
-                    start_timestamp: shortDuration.start,
-                    end_timestamp: shortDuration.end,
-                    fps_match: fps,
-                    total_matching_frames: 1
-                  }
-                },
-                i
-              )
-              return startSeconds
+              // Convert short video times to the ResolvedClip format
+              const clipWithShortTime: Clip = {
+                ...c,
+                movieStart: c.shortStart,
+                movieEnd: c.shortEnd,
+              }
+              return resolveClip(clipWithShortTime, i)
             })
         } else {
-          // For full movies, use matched_in_movie
+          // For full movies, extract clips from movieStart and movieEnd
           resolved = list
-            .filter((c) => c?.matched_in_movie?.start_timestamp)
-            .map((c, i) => resolveClip(c, i))
+            .filter((c) => c?.movieStart !== undefined && c?.movieEnd !== undefined)
+            .map((c, i) => {
+              // Use movieStart and movieEnd directly
+              const clipWithMovieTime: Clip = {
+                ...c,
+                movieStart: c.movieStart,
+                movieEnd: c.movieEnd,
+              }
+              return resolveClip(clipWithMovieTime, i)
+            })
         }
         
         if (!resolved.length) {
-          const fieldName = source === 'short' ? 'short_duration' : 'matched_in_movie'
+          const fieldName = source === 'short' ? 'shortStart/shortEnd' : 'movieStart/movieEnd'
           setParseError(`No clips found with ${fieldName} data for ${source === 'short' ? 'short video' : 'full movie'}.`)
           return
         }
@@ -69,7 +68,8 @@ export default function Page() {
         setVideoFile(video)
         setClips(resolved)
         setStep("preview")
-      } catch {
+      } catch (error) {
+        console.error("[v0] JSON parsing error:", error)
         setParseError("Failed to parse the JSON file. Make sure it is valid JSON.")
       }
     }

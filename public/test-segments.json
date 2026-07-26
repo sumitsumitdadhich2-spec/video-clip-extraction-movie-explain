@@ -1,0 +1,28 @@
+{
+  "segments": [
+    {
+      "shortStart": 0,
+      "shortEnd": 2.96,
+      "movieStart": 0.92,
+      "movieEnd": 3.52,
+      "confidence": 86.05,
+      "frameCount": 75
+    },
+    {
+      "shortStart": 3,
+      "shortEnd": 5.84,
+      "movieStart": 2.92,
+      "movieEnd": 5.64,
+      "confidence": 85.91,
+      "frameCount": 72
+    },
+    {
+      "shortStart": 7,
+      "shortEnd": 9.08,
+      "movieStart": 405.68,
+      "movieEnd": 405.88,
+      "confidence": 77.52,
+      "frameCount": 53
+    }
+  ]
+}
