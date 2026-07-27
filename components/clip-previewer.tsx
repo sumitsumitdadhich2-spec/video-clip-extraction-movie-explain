@@ -25,44 +25,43 @@ export function ClipPreviewer({ clips }: ClipPreviewerProps) {
         <table className="w-full text-left text-sm">
           <thead className="sticky top-0 bg-slate-800 text-slate-300">
             <tr>
-              <th className="px-3 py-2 font-medium">Scene</th>
-              <th className="px-3 py-2 font-medium">Movie start</th>
-              <th className="px-3 py-2 font-medium">Movie end</th>
+              <th className="px-3 py-2 font-medium">#</th>
+              <th className="px-3 py-2 font-medium">Start Time</th>
+              <th className="px-3 py-2 font-medium">End Time</th>
               <th className="px-3 py-2 font-medium">Duration</th>
               <th className="px-3 py-2 font-medium">Confidence</th>
             </tr>
           </thead>
           <tbody>
-            {clips.map((clip) => (
-              <tr
-                key={clip.index}
-                className="border-t border-slate-800 odd:bg-slate-900 even:bg-slate-900/40"
-              >
-                <td className="px-3 py-2 font-medium text-slate-100">{clip.short_video_clip}</td>
-                <td className="px-3 py-2 font-mono text-slate-300">
-                  {clip.matched_in_movie.start_timestamp}
-                  <span className="ml-1 text-xs text-slate-500">
-                    ({formatSeconds(clip.startSeconds)})
-                  </span>
-                </td>
-                <td className="px-3 py-2 font-mono text-slate-300">
-                  {clip.matched_in_movie.end_timestamp}
-                </td>
-                <td className="px-3 py-2 text-slate-300">{formatSeconds(clip.durationSeconds)}</td>
-                <td className="px-3 py-2">
-                  <span className="rounded bg-emerald-500/15 px-2 py-0.5 text-xs font-medium text-emerald-300">
-                    {clip.matched_in_movie.confidence}
-                  </span>
-                </td>
-              </tr>
-            ))}
+            {clips.map((clip) => {
+              const confidence = clip.confidence || clip.matched_in_movie?.confidence || "N/A"
+              return (
+                <tr
+                  key={clip.index}
+                  className="border-t border-slate-800 odd:bg-slate-900 even:bg-slate-900/40"
+                >
+                  <td className="px-3 py-2 font-medium text-slate-100">{clip.index + 1}</td>
+                  <td className="px-3 py-2 font-mono text-slate-300">
+                    {formatSeconds(clip.startSeconds)}
+                  </td>
+                  <td className="px-3 py-2 font-mono text-slate-300">
+                    {formatSeconds(clip.endSeconds)}
+                  </td>
+                  <td className="px-3 py-2 text-slate-300">{formatSeconds(clip.durationSeconds)}</td>
+                  <td className="px-3 py-2">
+                    <span className="rounded bg-emerald-500/15 px-2 py-0.5 text-xs font-medium text-emerald-300">
+                      {typeof confidence === 'number' ? confidence.toFixed(2) + '%' : confidence}
+                    </span>
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       </div>
 
       <p className="mt-3 text-xs text-slate-500">
-        Timestamps are read as MM:SS:FF at {clips[0]?.matched_in_movie.fps_match || 24}fps. Single-frame
-        matches are extended to a short minimum duration so they stay visible in the merged video.
+        Timestamps are in seconds. Single-frame matches are extended to a short minimum duration so they stay visible in the merged video.
       </p>
     </div>
   )

@@ -4,13 +4,14 @@ import { useState, useRef } from 'react'
 import { Button } from './ui/button'
 
 interface VideoUploaderProps {
-  onFilesSelected: (video: File, json: File) => void
+  onFilesSelected: (video: File, json: File, source: 'short' | 'full') => void
 }
 
 export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
   const [videoFile, setVideoFile] = useState<File | null>(null)
   const [jsonFile, setJsonFile] = useState<File | null>(null)
   const [dragActive, setDragActive] = useState(false)
+  const [videoSource, setVideoSource] = useState<'short' | 'full'>('full')
   const [jsonMode, setJsonMode] = useState<'upload' | 'paste'>('upload')
   const [pastedJson, setPastedJson] = useState('')
   const [pasteError, setPasteError] = useState('')
@@ -66,13 +67,49 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
   }
 
   const handleContinue = () => {
-    if (videoFile && jsonFile) onFilesSelected(videoFile, jsonFile)
+    if (videoFile && jsonFile) onFilesSelected(videoFile, jsonFile, videoSource)
   }
 
   const jsonReady = jsonMode === 'upload' ? !!jsonFile : !!jsonFile && !pasteError
 
   return (
     <div className="space-y-6">
+      {/* Video Source Selection */}
+      <div className="bg-slate-800 p-4 rounded-lg border border-slate-700">
+        <label className="text-slate-200 font-semibold text-sm block mb-3">
+          What type of video are you extracting clips from?
+        </label>
+        <div className="flex gap-3">
+          <button
+            type="button"
+            onClick={() => setVideoSource('short')}
+            className={`flex-1 py-3 px-4 rounded-lg border-2 transition font-semibold text-sm ${
+              videoSource === 'short'
+                ? 'border-blue-500 bg-blue-600 text-white'
+                : 'border-slate-600 bg-slate-700 text-slate-300 hover:bg-slate-600'
+            }`}
+          >
+            📹 Short Video Clip
+          </button>
+          <button
+            type="button"
+            onClick={() => setVideoSource('full')}
+            className={`flex-1 py-3 px-4 rounded-lg border-2 transition font-semibold text-sm ${
+              videoSource === 'full'
+                ? 'border-blue-500 bg-blue-600 text-white'
+                : 'border-slate-600 bg-slate-700 text-slate-300 hover:bg-slate-600'
+            }`}
+          >
+            🎬 Full Movie
+          </button>
+        </div>
+        <p className="text-xs text-slate-400 mt-3">
+          {videoSource === 'short'
+            ? 'Upload a short video file and JSON data to extract and merge matching scenes.'
+            : 'Upload a full movie file and JSON data to extract matching clips and merge them.'}
+        </p>
+      </div>
+
       <div
         onDragEnter={handleDrag}
         onDragLeave={handleDrag}
@@ -90,7 +127,7 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
           {/* Video File Upload */}
           <div className="bg-slate-700 p-5 rounded-lg">
             <span className="text-slate-200 font-semibold text-sm mb-3 block">
-              Movie File (MP4, MKV, etc.)
+              {videoSource === 'full' ? '🎬 Movie File' : '📹 Video File'} (MP4, MKV, AVI, etc.)
             </span>
             <input
               ref={videoInputRef}
@@ -115,31 +152,34 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
 
           {/* JSON — Upload or Paste toggle */}
           <div className="bg-slate-700 p-5 rounded-lg">
-            <div className="flex items-center justify-between mb-3">
-              <span className="text-slate-200 font-semibold text-sm">Metadata JSON</span>
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-3">
+              <div>
+                <span className="text-slate-200 font-semibold text-sm block">📋 Metadata (JSON, TXT, etc.)</span>
+                <p className="text-xs text-slate-400 mt-1">Any file format containing JSON data</p>
+              </div>
               {/* Toggle buttons */}
-              <div className="flex rounded overflow-hidden border border-slate-500 text-xs">
+              <div className="flex rounded overflow-hidden border border-slate-500 text-xs flex-shrink-0">
                 <button
                   type="button"
                   onClick={() => { setJsonMode('upload'); setPasteError('') }}
-                  className={`px-3 py-1 transition ${
+                  className={`px-3 py-1 transition whitespace-nowrap ${
                     jsonMode === 'upload'
                       ? 'bg-blue-600 text-white'
                       : 'bg-slate-600 text-slate-300 hover:bg-slate-500'
                   }`}
                 >
-                  Upload File
+                  Upload
                 </button>
                 <button
                   type="button"
                   onClick={() => { setJsonMode('paste'); setPasteError('') }}
-                  className={`px-3 py-1 transition ${
+                  className={`px-3 py-1 transition whitespace-nowrap ${
                     jsonMode === 'paste'
                       ? 'bg-blue-600 text-white'
                       : 'bg-slate-600 text-slate-300 hover:bg-slate-500'
                   }`}
                 >
-                  Paste JSON
+                  Paste
                 </button>
               </div>
             </div>
@@ -149,7 +189,7 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
                 <input
                   ref={jsonInputRef}
                   type="file"
-                  accept="application/json,.json"
+                  accept=".json,.txt,.csv,*"
                   onChange={handleJsonChange}
                   className="hidden"
                 />
@@ -157,7 +197,7 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
                   onClick={() => jsonInputRef.current?.click()}
                   className="bg-slate-600 hover:bg-slate-500 cursor-pointer p-4 rounded border border-slate-500 transition text-center"
                 >
-                  <p className="text-slate-300 text-sm">Click to select JSON file</p>
+                  <p className="text-slate-300 text-sm">Click to select file (JSON, TXT, etc.)</p>
                 </div>
                 {jsonFile && (
                   <div className="mt-3 p-3 bg-green-900/30 rounded border border-green-700">
@@ -187,7 +227,15 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
                 )}
                 {jsonFile && !pasteError && pastedJson && (
                   <p className="text-green-400 text-xs mt-1">
-                    Valid JSON — {JSON.parse(pastedJson).length ?? '?'} clip(s) found
+                    {(() => {
+                      try {
+                        const parsed = JSON.parse(pastedJson)
+                        const count = Array.isArray(parsed) ? parsed.length : parsed.clips?.length || parsed.scenes?.length || parsed.segments?.length || 0
+                        return `Valid JSON — ${count} clip(s) found`
+                      } catch {
+                        return 'Valid JSON'
+                      }
+                    })()}
                   </p>
                 )}
               </>
@@ -208,8 +256,9 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
 
       {/* Format reference */}
       <div className="bg-slate-700 p-4 rounded-lg">
-        <h3 className="text-slate-200 font-semibold text-sm mb-2">Expected JSON Format</h3>
+        <h3 className="text-slate-200 font-semibold text-sm mb-2">📝 Expected JSON Format</h3>
         <p className="text-xs text-slate-400 mb-2">
+          Your metadata file (JSON, TXT, etc.) should contain JSON data with clip segments. 
           Timestamps are <code className="text-slate-300">MM:SS:FF</code> (minutes : seconds : frames) at the given <code className="text-slate-300">fps_match</code>.
         </p>
         <pre className="bg-slate-800 p-3 rounded text-xs text-slate-300 overflow-x-auto leading-relaxed">

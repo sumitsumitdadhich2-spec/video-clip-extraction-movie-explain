@@ -14,25 +14,62 @@ export default function Page() {
   const [clips, setClips] = useState<ResolvedClip[]>([])
   const [step, setStep] = useState<Step>("upload")
   const [parseError, setParseError] = useState<string | null>(null)
+  const [videoSource, setVideoSource] = useState<'short' | 'full'>('full')
 
-  const handleFilesSelected = (video: File, json: File) => {
+  const handleFilesSelected = (video: File, json: File, source: 'short' | 'full') => {
     setParseError(null)
+    setVideoSource(source)
     const reader = new FileReader()
     reader.onload = (e) => {
       try {
         const raw = JSON.parse(e.target?.result as string)
-        const list: Clip[] = Array.isArray(raw) ? raw : raw.clips || raw.scenes || []
+        const list: Clip[] = Array.isArray(raw) ? raw : raw.clips || raw.scenes || raw.segments || []
         if (!list.length) {
-          setParseError("No clips found in the JSON. Expected an array of scenes.")
+          setParseError("No clips found in the JSON. Expected an array of scenes or segments.")
           return
         }
-        const resolved = list
-          .filter((c) => c?.matched_in_movie?.start_timestamp)
-          .map((c, i) => resolveClip(c, i))
+        
+        // Filter and map clips based on video source selection
+        let resolved: ResolvedClip[]
+        if (source === 'short') {
+          // For short videos, extract clips from shortStart and shortEnd
+          resolved = list
+            .filter((c) => c?.shortStart !== undefined && c?.shortEnd !== undefined)
+            .map((c, i) => {
+              // Convert short video times to the ResolvedClip format
+              const clipWithShortTime: Clip = {
+                ...c,
+                movieStart: c.shortStart,
+                movieEnd: c.shortEnd,
+              }
+              return resolveClip(clipWithShortTime, i)
+            })
+        } else {
+          // For full movies, extract clips from movieStart and movieEnd
+          resolved = list
+            .filter((c) => c?.movieStart !== undefined && c?.movieEnd !== undefined)
+            .map((c, i) => {
+              // Use movieStart and movieEnd directly
+              const clipWithMovieTime: Clip = {
+                ...c,
+                movieStart: c.movieStart,
+                movieEnd: c.movieEnd,
+              }
+              return resolveClip(clipWithMovieTime, i)
+            })
+        }
+        
+        if (!resolved.length) {
+          const fieldName = source === 'short' ? 'shortStart/shortEnd' : 'movieStart/movieEnd'
+          setParseError(`No clips found with ${fieldName} data for ${source === 'short' ? 'short video' : 'full movie'}.`)
+          return
+        }
+        
         setVideoFile(video)
         setClips(resolved)
         setStep("preview")
-      } catch {
+      } catch (error) {
+        console.error("[v0] JSON parsing error:", error)
         setParseError("Failed to parse the JSON file. Make sure it is valid JSON.")
       }
     }
@@ -98,9 +135,16 @@ export default function Page() {
                   <h2 className="text-lg font-semibold text-slate-100">
                     {clips.length} clips detected
                   </h2>
-                  <p className="text-sm text-slate-400">
-                    Source: <span className="text-slate-300">{videoFile?.name}</span>
-                  </p>
+                  <div className="space-y-1">
+                    <p className="text-sm text-slate-400">
+                      Video: <span className="text-slate-300">{videoFile?.name}</span>
+                    </p>
+                    <p className="text-sm text-slate-400">
+                      Type: <span className={`text-sm font-semibold ${videoSource === 'short' ? 'text-purple-400' : 'text-blue-400'}`}>
+                        {videoSource === 'short' ? '📹 Short Video' : '🎬 Full Movie'}
+                      </span>
+                    </p>
+                  </div>
                 </div>
                 <div className="flex gap-2">
                   <Button

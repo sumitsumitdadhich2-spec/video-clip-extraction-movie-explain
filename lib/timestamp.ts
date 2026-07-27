@@ -31,21 +31,27 @@ export function timecodeToSeconds(timecode: string, fps = 24): number {
 }
 
 export interface Clip {
-  short_video_clip: string
+  short_video_clip?: string
   short_duration?: {
-    start: string
-    end: string
-    duration_seconds: number
+    start: string | number
+    end: string | number
+    duration_seconds?: number
   }
-  matched_in_movie: {
-    movie_name: string
-    start_timestamp: string
-    end_timestamp: string
-    confidence: string
-    fps_match: number
-    total_matching_frames: number
+  shortStart?: number
+  shortEnd?: number
+  movieStart?: number
+  movieEnd?: number
+  matched_in_movie?: {
+    movie_name?: string
+    start_timestamp?: string
+    end_timestamp?: string
+    confidence?: string | number
+    fps_match?: number
+    total_matching_frames?: number
     metadata_validation?: string
   }
+  confidence?: number
+  frameCount?: number
 }
 
 export interface ResolvedClip extends Clip {
@@ -58,9 +64,29 @@ export interface ResolvedClip extends Clip {
 // Resolves a raw clip into concrete start/duration in seconds, applying a
 // minimum duration so single-frame matches still produce a valid, visible clip.
 export function resolveClip(clip: Clip, index: number, minDuration = 0.4): ResolvedClip {
-  const fps = clip.matched_in_movie.fps_match || 24
-  let startSeconds = timecodeToSeconds(clip.matched_in_movie.start_timestamp, fps)
-  let endSeconds = timecodeToSeconds(clip.matched_in_movie.end_timestamp, fps)
+  let startSeconds = 0
+  let endSeconds = 0
+  let fps = 24
+
+  // Try to extract timestamps from various possible formats
+  if (clip.matched_in_movie?.start_timestamp) {
+    // Old format: MM:SS:FF timecode
+    fps = clip.matched_in_movie.fps_match || 24
+    startSeconds = timecodeToSeconds(clip.matched_in_movie.start_timestamp, fps)
+    endSeconds = timecodeToSeconds(clip.matched_in_movie.end_timestamp || "00:00:00", fps)
+  } else if (clip.movieStart !== undefined && clip.movieEnd !== undefined) {
+    // New format: direct seconds
+    startSeconds = clip.movieStart
+    endSeconds = clip.movieEnd
+  } else if (clip.short_duration?.start !== undefined && clip.short_duration?.end !== undefined) {
+    // Alternative format: short_duration with direct values
+    startSeconds = typeof clip.short_duration.start === 'string' 
+      ? timecodeToSeconds(clip.short_duration.start, fps)
+      : clip.short_duration.start
+    endSeconds = typeof clip.short_duration.end === 'string'
+      ? timecodeToSeconds(clip.short_duration.end, fps)
+      : clip.short_duration.end
+  }
 
   // Some entries have end < start (bad data) — swap them.
   if (endSeconds < startSeconds) {
@@ -71,7 +97,7 @@ export function resolveClip(clip: Clip, index: number, minDuration = 0.4): Resol
 
   // Fall back to the matching-frame count when the range is empty.
   if (durationSeconds <= 0) {
-    const frames = clip.matched_in_movie.total_matching_frames || 1
+    const frames = clip.matched_in_movie?.total_matching_frames || clip.frameCount || 1
     durationSeconds = frames / fps
   }
 
