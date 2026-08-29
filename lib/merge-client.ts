@@ -40,6 +40,7 @@ async function getMergeFFmpeg(): Promise<FFmpeg> {
 
 export interface StreamInfo {
   videoCodec: string | null
+  videoProfile: string | null
   width: number | null
   height: number | null
   fps: number | null
@@ -51,6 +52,7 @@ export interface StreamInfo {
 function parseStreamInfo(logs: string[]): StreamInfo {
   const info: StreamInfo = {
     videoCodec: null,
+    videoProfile: null,
     width: null,
     height: null,
     fps: null,
@@ -63,6 +65,8 @@ function parseStreamInfo(logs: string[]): StreamInfo {
     if (line.includes("Video:") && info.videoCodec === null) {
       const codecMatch = line.match(/Video:\s*(\w+)/)
       if (codecMatch) info.videoCodec = codecMatch[1]
+      const profileMatch = line.match(/Video:\s*\w+\s*\(([^)/]+)\)/)
+      if (profileMatch) info.videoProfile = profileMatch[1].trim()
       const dimMatch = line.match(/(\d{2,5})x(\d{2,5})/)
       if (dimMatch) {
         info.width = Number.parseInt(dimMatch[1], 10)
@@ -96,21 +100,23 @@ async function probeFile(ff: FFmpeg, name: string): Promise<StreamInfo> {
   return parseStreamInfo(logBuffer)
 }
 
-function fpsClose(a: number | null, b: number | null): boolean {
-  if (a === null || b === null) return false
-  return Math.abs(a - b) < 0.05
-}
-
-function streamsCompatible(a: StreamInfo, b: StreamInfo): boolean {
+// Video streams can be stream-copied together as long as codec + resolution
+// match. FPS does NOT need to match — h264/h265 timestamps are per-packet,
+// so mixed frame rates play back correctly after concat.
+function videoCompatible(a: StreamInfo, b: StreamInfo): boolean {
   return (
     a.videoCodec !== null &&
     a.videoCodec === b.videoCodec &&
     a.width === b.width &&
-    a.height === b.height &&
-    fpsClose(a.fps, b.fps) &&
-    a.audioCodec === b.audioCodec &&
-    a.sampleRate === b.sampleRate
+    a.height === b.height
   )
+}
+
+// Audio needs matching codec + sample rate for a clean copy-concat
+// (a sample-rate switch mid-stream plays at the wrong pitch in most players).
+function audioCompatible(a: StreamInfo, b: StreamInfo): boolean {
+  if (a.audioCodec === null && b.audioCodec === null) return true
+  return a.audioCodec === b.audioCodec && a.sampleRate === b.sampleRate
 }
 
 // ---------------------------------------------------------------------------
@@ -176,13 +182,45 @@ export async function mergeVideos(
     onProgress?.(40)
     const shortInfo = await probeFile(ff, SHORT_IN)
     const movieInfo = await probeFile(ff, MOVIE_IN)
-    console.log("[v0] shortInfo:", JSON.stringify(shortInfo))
-    console.log("[v0] movieInfo:", JSON.stringify(movieInfo))
 
     let shortName = SHORT_IN
     let usedFallback = false
 
-    if (!streamsCompatible(shortInfo, movieInfo)) {
+    const vOk = videoCompatible(shortInfo, movieInfo)
+    const aOk = audioCompatible(shortInfo, movieInfo)
+
+    if (vOk && !aOk) {
+      // FAST PATH: video matches — copy it bit-for-bit, convert ONLY the
+      // short's tiny audio track. Takes a second or two even for long shorts.
+      usedFallback = true
+      onStatus?.("Video formats match — fixing only the short's audio track (video untouched)...")
+      onProgress?.(50)
+
+      const targetSR = movieInfo.sampleRate ? String(movieInfo.sampleRate) : "44100"
+      const movieHasAudio = movieInfo.audioCodec !== null
+      const shortHasAudio = shortInfo.audioCodec !== null
+
+      const args: string[] = ["-i", SHORT_IN]
+      if (movieHasAudio && !shortHasAudio) {
+        args.push("-f", "lavfi", "-i", `anullsrc=r=${targetSR}:cl=stereo`)
+        args.push("-map", "0:v:0", "-map", "1:a:0", "-shortest")
+      }
+      args.push("-c:v", "copy")
+      if (movieHasAudio) {
+        args.push("-c:a", "aac", "-ar", targetSR, "-ac", "2")
+      } else {
+        args.push("-an")
+      }
+      args.push("-y", SHORT_FIXED)
+
+      logBuffer = []
+      const audioRet = await ff.exec(args)
+      if (audioRet !== 0) {
+        console.log("[v0] audio-only fix failed, logs tail:", logBuffer.slice(-10).join(" | "))
+        throw new Error("Could not adapt the short video's audio. Try a different short file.")
+      }
+      shortName = SHORT_FIXED
+    } else if (!vOk) {
       // Fallback: convert ONLY the short to match the movie. Movie untouched.
       usedFallback = true
       onStatus?.("Formats differ — converting only the short video to match the movie (movie stays original quality)...")
@@ -193,9 +231,27 @@ export async function mergeVideos(
       const targetFps = movieInfo.fps ? movieInfo.fps.toFixed(3) : "24"
       const targetSR = movieInfo.sampleRate ? String(movieInfo.sampleRate) : "44100"
 
-      await ff.exec([
-        "-i",
-        SHORT_IN,
+      // Match the movie's h264 profile so the copied movie packets and the
+      // re-encoded short packets share one decoder configuration — mixed
+      // profiles in a single stream glitch in some players.
+      const profileLower = (movieInfo.videoProfile ?? "").toLowerCase()
+      const targetProfile = profileLower.includes("baseline")
+        ? "baseline"
+        : profileLower.includes("main")
+          ? "main"
+          : "high"
+
+      // Concat with -c copy requires IDENTICAL stream layouts. If the movie
+      // has audio but the short doesn't, give the short a silent track; if
+      // the movie has no audio, strip the short's audio.
+      const movieHasAudio = movieInfo.audioCodec !== null
+      const shortHasAudio = shortInfo.audioCodec !== null
+
+      const args: string[] = ["-i", SHORT_IN]
+      if (movieHasAudio && !shortHasAudio) {
+        args.push("-f", "lavfi", "-i", `anullsrc=r=${targetSR}:cl=stereo`)
+      }
+      args.push(
         "-vf",
         `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease,pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2,fps=${targetFps},format=yuv420p`,
         "-c:v",
@@ -204,15 +260,25 @@ export async function mergeVideos(
         "ultrafast",
         "-crf",
         "18",
-        "-c:a",
-        "aac",
-        "-ar",
-        targetSR,
-        "-ac",
-        "2",
-        "-y",
-        SHORT_FIXED,
-      ])
+        "-profile:v",
+        targetProfile,
+      )
+      if (movieHasAudio) {
+        if (!shortHasAudio) {
+          args.push("-map", "0:v:0", "-map", "1:a:0", "-shortest")
+        }
+        args.push("-c:a", "aac", "-ar", targetSR, "-ac", "2")
+      } else {
+        args.push("-an")
+      }
+      args.push("-y", SHORT_FIXED)
+
+      logBuffer = []
+      const encodeRet = await ff.exec(args)
+      if (encodeRet !== 0) {
+        console.log("[v0] fallback encode failed, logs tail:", logBuffer.slice(-10).join(" | "))
+        throw new Error("Could not convert the short video to match the movie format. Try a different short file.")
+      }
       shortName = SHORT_FIXED
     }
 
@@ -234,11 +300,17 @@ export async function mergeVideos(
       LIST_FILE,
       "-c",
       "copy",
+      "-fflags",
+      "+genpts",
+      "-avoid_negative_ts",
+      "make_zero",
       "-y",
       OUTPUT,
     ])
-    console.log("[v0] concat exit code:", concatRet)
-    console.log("[v0] concat logs tail:", logBuffer.slice(-15).join(" | "))
+    if (concatRet !== 0) {
+      console.log("[v0] concat failed, logs tail:", logBuffer.slice(-15).join(" | "))
+      throw new Error("Merging failed while joining the two videos. The files may be in an unsupported format.")
+    }
 
     // Free the inputs BEFORE reading the output — halves peak memory,
     // which matters for large movies.
@@ -250,6 +322,9 @@ export async function mergeVideos(
     onStatus?.("Preparing download...")
     onProgress?.(90)
     const data = (await ff.readFile(OUTPUT)) as Uint8Array
+    if (data.byteLength === 0) {
+      throw new Error("Merge produced an empty file. The inputs may be in an unsupported format.")
+    }
     const blob = new Blob([data as BlobPart], { type: "video/mp4" })
     const url = URL.createObjectURL(blob)
 
