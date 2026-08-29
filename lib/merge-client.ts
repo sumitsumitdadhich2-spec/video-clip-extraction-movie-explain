@@ -13,7 +13,29 @@ const WORKERFS = "WORKERFS" as FFFSType
 const CORE_JS = "/ffmpeg/ffmpeg-core.js"
 const CORE_WASM = "/ffmpeg/ffmpeg-core.wasm"
 
+// Self-hosted MULTI-THREADED core — uses ALL CPU cores for the conversion
+// step (4-6x faster). Requires SharedArrayBuffer (cross-origin isolation),
+// so we feature-detect and fall back to the single-threaded core when the
+// browser/embedding context doesn't allow it.
+const CORE_MT_JS = "/ffmpeg-mt/ffmpeg-core.js"
+const CORE_MT_WASM = "/ffmpeg-mt/ffmpeg-core.wasm"
+const CORE_MT_WORKER = "/ffmpeg-mt/ffmpeg-core.worker.js"
+
+/** True when the page is cross-origin isolated and SharedArrayBuffer exists. */
+export function multiThreadAvailable(): boolean {
+  try {
+    return (
+      typeof SharedArrayBuffer !== "undefined" &&
+      typeof crossOriginIsolated !== "undefined" &&
+      crossOriginIsolated === true
+    )
+  } catch {
+    return false
+  }
+}
+
 let mergeFF: FFmpeg | null = null
+let mergeFFIsMT = false
 let logBuffer: string[] = []
 
 // Dispatches ffmpeg's real progress reports (out_time of the file being
@@ -22,6 +44,9 @@ let logBuffer: string[] = []
 let activeProgress: ((timeUs: number, libProgress: number) => void) | null = null
 
 async function getMergeFFmpeg(): Promise<FFmpeg> {
+  const wantMT = multiThreadAvailable()
+  // If a single-threaded engine is cached but MT is now available (or vice
+  // versa), keep using the cached one — consistency beats a reload mid-flow.
   if (mergeFF) return mergeFF
 
   const instance = new FFmpeg()
@@ -34,12 +59,28 @@ async function getMergeFFmpeg(): Promise<FFmpeg> {
     activeProgress?.(time, progress)
   })
 
+  if (wantMT) {
+    try {
+      await instance.load({
+        coreURL: await toBlobURL(CORE_MT_JS, "text/javascript"),
+        wasmURL: await toBlobURL(CORE_MT_WASM, "application/wasm"),
+        workerURL: await toBlobURL(CORE_MT_WORKER, "text/javascript"),
+      })
+      mergeFF = instance
+      mergeFFIsMT = true
+      return instance
+    } catch {
+      // MT core failed to load — fall through to the single-threaded core.
+    }
+  }
+
   await instance.load({
     coreURL: await toBlobURL(CORE_JS, "text/javascript"),
     wasmURL: await toBlobURL(CORE_WASM, "application/wasm"),
   })
 
   mergeFF = instance
+  mergeFFIsMT = false
   return instance
 }
 
@@ -55,6 +96,7 @@ function destroyMergeFFmpeg() {
     }
     mergeFF = null
   }
+  mergeFFIsMT = false
   activeProgress = null
   logBuffer = []
 }
@@ -386,7 +428,11 @@ export async function mergeVideos(
     } else if (!vOk) {
       // Fallback: convert ONLY the short to match the movie. Movie untouched.
       usedFallback = true
-      onStatus?.("Formats differ — converting only the short video to match the movie (movie stays original quality)...")
+      onStatus?.(
+        mergeFFIsMT
+          ? "Formats differ — fast multi-core conversion of the short video (movie stays original quality)..."
+          : "Formats differ — converting only the short video to match the movie (movie stays original quality)...",
+      )
       onProgress?.(8)
 
       const targetW = movieInfo.width ?? 1280
@@ -426,6 +472,10 @@ export async function mergeVideos(
         "-profile:v",
         targetProfile,
       )
+      if (mergeFFIsMT) {
+        // Use every available CPU core for the encode (4-6x faster).
+        args.push("-threads", "0")
+      }
       if (movieHasAudio) {
         if (!shortHasAudio) {
           args.push("-map", "0:v:0", "-map", "1:a:0", "-shortest")
