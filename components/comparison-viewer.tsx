@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { formatSeconds, type MappingPair } from "@/lib/report-parser"
 import { subscribeBackground, type BackgroundState } from "@/lib/ffmpeg-client"
@@ -19,31 +19,59 @@ export function ComparisonViewer({ shortFile, movieFile, pairs }: ComparisonView
   const shortRef = useRef<HTMLVideoElement>(null)
   const movieRef = useRef<HTMLVideoElement>(null)
 
-  const shortUrl = useMemo(() => URL.createObjectURL(shortFile), [shortFile])
-  const movieUrl = useMemo(() => URL.createObjectURL(movieFile), [movieFile])
+  // Object URLs are created inside effects (not useMemo) so that React Strict
+  // Mode's mount → cleanup → remount cycle in dev doesn't leave the <video>
+  // elements pointing at revoked URLs.
+  const [shortUrl, setShortUrl] = useState<string | null>(null)
+  const [movieUrl, setMovieUrl] = useState<string | null>(null)
+  const [videoError, setVideoError] = useState<string | null>(null)
 
   useEffect(() => {
-    return () => {
-      URL.revokeObjectURL(shortUrl)
-      URL.revokeObjectURL(movieUrl)
-    }
-  }, [shortUrl, movieUrl])
+    const url = URL.createObjectURL(shortFile)
+    setShortUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [shortFile])
+
+  useEffect(() => {
+    const url = URL.createObjectURL(movieFile)
+    setMovieUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [movieFile])
 
   useEffect(() => subscribeBackground(setBg), [])
 
   const pair = pairs[current]
 
-  // Seek both videos to the current pair's segment start whenever pair changes.
+  // Seeks immediately when metadata is available; otherwise waits for the
+  // loadedmetadata event (seeking a video with readyState 0 is silently dropped).
+  const safeSeek = useCallback((video: HTMLVideoElement, time: number) => {
+    if (video.readyState >= 1) {
+      video.currentTime = time
+      return () => {}
+    }
+    const onLoaded = () => {
+      video.currentTime = time
+    }
+    video.addEventListener("loadedmetadata", onLoaded, { once: true })
+    return () => video.removeEventListener("loadedmetadata", onLoaded)
+  }, [])
+
+  // Seek both videos to the current pair's segment start whenever pair changes
+  // (and once the object URLs are attached).
   useEffect(() => {
     const sv = shortRef.current
     const mv = movieRef.current
-    if (!sv || !mv || !pair) return
+    if (!sv || !mv || !pair || !shortUrl || !movieUrl) return
     sv.pause()
     mv.pause()
     setPlaying(false)
-    sv.currentTime = pair.shortStart
-    mv.currentTime = pair.movieStart
-  }, [pair])
+    const cleanShort = safeSeek(sv, pair.shortStart)
+    const cleanMovie = safeSeek(mv, pair.movieStart)
+    return () => {
+      cleanShort()
+      cleanMovie()
+    }
+  }, [pair, shortUrl, movieUrl, safeSeek])
 
   // Loop each video within its segment bounds.
   useEffect(() => {
@@ -129,6 +157,12 @@ export function ComparisonViewer({ shortFile, movieFile, pairs }: ComparisonView
 
   return (
     <div className="space-y-4">
+      {videoError && (
+        <div className="rounded-lg border border-red-800/60 bg-red-950/40 p-3 text-sm text-red-300">
+          {videoError}
+        </div>
+      )}
+
       {/* Pair navigation */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
@@ -183,10 +217,15 @@ export function ComparisonViewer({ shortFile, movieFile, pairs }: ComparisonView
           <p className="mb-2 text-sm font-semibold text-purple-300">Short Video</p>
           <video
             ref={shortRef}
-            src={shortUrl}
+            src={shortUrl ?? undefined}
             playsInline
             muted
             preload="auto"
+            onError={() =>
+              setVideoError(
+                `Short video (${shortFile.name}) could not be loaded — the browser may not support this format/codec. MP4 (H.264) works best.`,
+              )
+            }
             className="aspect-video w-full rounded bg-black"
           />
           <div className="mt-2 space-y-0.5 text-xs text-slate-400">
@@ -203,9 +242,14 @@ export function ComparisonViewer({ shortFile, movieFile, pairs }: ComparisonView
           <p className="mb-2 text-sm font-semibold text-blue-300">Movie</p>
           <video
             ref={movieRef}
-            src={movieUrl}
+            src={movieUrl ?? undefined}
             playsInline
             preload="auto"
+            onError={() =>
+              setVideoError(
+                `Movie file (${movieFile.name}) could not be loaded — the browser may not support this format/codec. MP4 (H.264) works best.`,
+              )
+            }
             className="aspect-video w-full rounded bg-black"
           />
           <div className="mt-2 space-y-0.5 text-xs text-slate-400">
