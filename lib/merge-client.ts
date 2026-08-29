@@ -13,50 +13,88 @@ const WORKERFS = "WORKERFS" as FFFSType
 const CORE_JS = "/ffmpeg/ffmpeg-core.js"
 const CORE_WASM = "/ffmpeg/ffmpeg-core.wasm"
 
-let mergeFF: FFmpeg | null = null
-let logBuffer: string[] = []
+// Self-hosted MULTI-THREADED core — uses ALL CPU cores for the conversion
+// step (4-6x faster). Requires SharedArrayBuffer (cross-origin isolation),
+// so we feature-detect and fall back to the single-threaded core when the
+// browser/embedding context doesn't allow it.
+const CORE_MT_JS = "/ffmpeg-mt/ffmpeg-core.js"
+const CORE_MT_WASM = "/ffmpeg-mt/ffmpeg-core.wasm"
+const CORE_MT_WORKER = "/ffmpeg-mt/ffmpeg-core.worker.js"
 
-// Dispatches ffmpeg's real progress reports (out_time of the file being
-// written) to whichever step is currently running. Set to null when no
-// step wants progress (e.g. during probes).
-let activeProgress: ((timeUs: number, libProgress: number) => void) | null = null
+/** True when the page is cross-origin isolated and SharedArrayBuffer exists. */
+export function multiThreadAvailable(): boolean {
+  try {
+    return (
+      typeof SharedArrayBuffer !== "undefined" &&
+      typeof crossOriginIsolated !== "undefined" &&
+      crossOriginIsolated === true
+    )
+  } catch {
+    return false
+  }
+}
 
-async function getMergeFFmpeg(): Promise<FFmpeg> {
-  if (mergeFF) return mergeFF
+// ---------------------------------------------------------------------------
+// Per-job engine — each merge job gets its OWN ffmpeg instance so multiple
+// merges can run in PARALLEL without sharing state or files.
+// ---------------------------------------------------------------------------
 
+interface Engine {
+  ff: FFmpeg
+  isMT: boolean
+  logBuffer: string[]
+  // Dispatches ffmpeg's real progress reports (out_time of the file being
+  // written) to whichever step is currently running on THIS engine.
+  activeProgress: ((timeUs: number, libProgress: number) => void) | null
+}
+
+async function createEngine(): Promise<Engine> {
   const instance = new FFmpeg()
+  const engine: Engine = { ff: instance, isMT: false, logBuffer: [], activeProgress: null }
+
   instance.on("log", ({ message }) => {
-    logBuffer.push(message)
+    engine.logBuffer.push(message)
     // Keep the buffer bounded — a 3GB stream copy can emit a LOT of lines.
-    if (logBuffer.length > 400) logBuffer.splice(0, logBuffer.length - 200)
+    if (engine.logBuffer.length > 400) engine.logBuffer.splice(0, engine.logBuffer.length - 200)
   })
   instance.on("progress", ({ progress, time }) => {
-    activeProgress?.(time, progress)
+    engine.activeProgress?.(time, progress)
   })
+
+  if (multiThreadAvailable()) {
+    try {
+      await instance.load({
+        coreURL: await toBlobURL(CORE_MT_JS, "text/javascript"),
+        wasmURL: await toBlobURL(CORE_MT_WASM, "application/wasm"),
+        workerURL: await toBlobURL(CORE_MT_WORKER, "text/javascript"),
+      })
+      engine.isMT = true
+      return engine
+    } catch {
+      // MT core failed to load — fall through to the single-threaded core.
+    }
+  }
 
   await instance.load({
     coreURL: await toBlobURL(CORE_JS, "text/javascript"),
     wasmURL: await toBlobURL(CORE_WASM, "application/wasm"),
   })
 
-  mergeFF = instance
-  return instance
+  return engine
 }
 
-// Fully discard the ffmpeg instance. Used after errors (so a broken/OOM'd
-// engine never lingers) and after very large merges (WASM heaps grow but
-// never shrink — a fresh instance returns that memory to the browser).
-function destroyMergeFFmpeg() {
-  if (mergeFF) {
-    try {
-      mergeFF.terminate()
-    } catch {
-      // already dead — ignore
-    }
-    mergeFF = null
+// Fully discard an engine. Called after EVERY job (success or failure) —
+// WASM heaps grow but never shrink, so retiring the instance hands the
+// memory back to the browser and keeps parallel jobs from starving each
+// other. A fresh engine loads in ~1s.
+function destroyEngine(engine: Engine) {
+  try {
+    engine.ff.terminate()
+  } catch {
+    // already dead — ignore
   }
-  activeProgress = null
-  logBuffer = []
+  engine.activeProgress = null
+  engine.logBuffer = []
 }
 
 // ---------------------------------------------------------------------------
@@ -124,16 +162,16 @@ function parseStreamInfo(logs: string[]): StreamInfo {
   return info
 }
 
-async function probeFile(ff: FFmpeg, name: string): Promise<StreamInfo> {
-  logBuffer = []
+async function probeFile(engine: Engine, name: string): Promise<StreamInfo> {
+  engine.logBuffer = []
   // `ffmpeg -i file` exits with an error (no output specified) but prints
   // full stream info to the log — that's all we need. Wrap in try/catch.
   try {
-    await ff.exec(["-i", name])
+    await engine.ff.exec(["-i", name])
   } catch {
     // expected — no output file was requested
   }
-  return parseStreamInfo(logBuffer)
+  return parseStreamInfo(engine.logBuffer)
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +192,7 @@ export interface MergeHandlers {
  * duration; when unknown we fall back to ffmpeg's own progress ratio.
  */
 async function execWithProgress(
-  ff: FFmpeg,
+  engine: Engine,
   args: string[],
   opts: {
     baseline: number
@@ -168,7 +206,7 @@ async function execWithProgress(
   const startedAt = Date.now()
   let lastPercent = -1
 
-  activeProgress = (timeUs, libProgress) => {
+  engine.activeProgress = (timeUs, libProgress) => {
     let f: number
     if (totalSec && totalSec > 0 && Number.isFinite(timeUs) && timeUs > 0) {
       f = timeUs / 1_000_000 / totalSec
@@ -197,10 +235,10 @@ async function execWithProgress(
   }
 
   try {
-    logBuffer = []
-    return await ff.exec(args)
+    engine.logBuffer = []
+    return await engine.ff.exec(args)
   } finally {
-    activeProgress = null
+    engine.activeProgress = null
     onEta?.(null)
   }
 }
@@ -220,6 +258,8 @@ export function formatEta(seconds: number): string {
 
 export interface MergeResult {
   url: string
+  /** The merged file itself — used to save it to cloud storage (history). */
+  blob: Blob
   sizeBytes: number
   usedFallback: boolean
 }
@@ -236,22 +276,22 @@ function extOf(file: File): string {
   return m ? m[1].toLowerCase() : "mp4"
 }
 
-async function safeDelete(ff: FFmpeg, name: string) {
+async function safeDelete(engine: Engine, name: string) {
   try {
-    await ff.deleteFile(name)
+    await engine.ff.deleteFile(name)
   } catch {
     // file may not exist — ignore
   }
 }
 
-async function safeUnmount(ff: FFmpeg) {
+async function safeUnmount(engine: Engine) {
   try {
-    await ff.unmount(MOUNT_DIR)
+    await engine.ff.unmount(MOUNT_DIR)
   } catch {
     // not mounted — ignore
   }
   try {
-    await ff.deleteDir(MOUNT_DIR)
+    await engine.ff.deleteDir(MOUNT_DIR)
   } catch {
     // dir may not exist — ignore
   }
@@ -279,9 +319,8 @@ function isMemoryError(err: unknown): boolean {
  * is re-encoded to match the movie's parameters (short = tiny, takes
  * seconds). The movie is NEVER re-encoded — always stream-copied.
  *
- * Large-file stability: both inputs are mounted via WORKERFS, so ffmpeg
- * streams them directly from disk instead of copying them into WASM memory.
- * Only the OUTPUT occupies memory, roughly halving peak usage vs. before.
+ * PARALLEL-SAFE: every call creates its own isolated ffmpeg engine, so
+ * multiple merges can run at the same time without interfering.
  */
 export async function mergeVideos(
   shortFile: File,
@@ -292,18 +331,17 @@ export async function mergeVideos(
 
   onStatus?.("Loading merge engine...")
   onProgress?.(1)
-  const ff = await getMergeFFmpeg()
+  const engine = await createEngine()
+  const ff = engine.ff
 
   const SHORT_IN = `${MOUNT_DIR}/a.${extOf(shortFile)}`
   const MOVIE_IN = `${MOUNT_DIR}/b.${extOf(movieFile)}`
-
-  let failed = false
 
   try {
     // Mount inputs — instant, zero copy, works for multi-GB files.
     onStatus?.("Opening files (direct disk access — no memory copy)...")
     onProgress?.(3)
-    await safeUnmount(ff)
+    await safeUnmount(engine)
     await ff.createDir(MOUNT_DIR)
     await ff.mount(
       WORKERFS,
@@ -318,11 +356,11 @@ export async function mergeVideos(
 
     onStatus?.("Analyzing Part A (short video)...")
     onProgress?.(4)
-    const shortInfo = await probeFile(ff, SHORT_IN)
+    const shortInfo = await probeFile(engine, SHORT_IN)
 
     onStatus?.("Analyzing Part B (full movie)...")
     onProgress?.(6)
-    const movieInfo = await probeFile(ff, MOVIE_IN)
+    const movieInfo = await probeFile(engine, MOVIE_IN)
 
     // Total output duration — the base for ACCURATE percentage reporting.
     const totalDurationSec =
@@ -371,7 +409,7 @@ export async function mergeVideos(
       }
       args.push("-y", SHORT_FIXED)
 
-      const audioRet = await execWithProgress(ff, args, {
+      const audioRet = await execWithProgress(engine, args, {
         baseline: 8,
         span: 14,
         totalSec: shortInfo.durationSec,
@@ -379,14 +417,18 @@ export async function mergeVideos(
         onEta,
       })
       if (audioRet !== 0) {
-        console.log("[v0] audio-only fix failed, logs tail:", logBuffer.slice(-10).join(" | "))
+        console.log("[v0] audio-only fix failed, logs tail:", engine.logBuffer.slice(-10).join(" | "))
         throw new Error("Could not adapt the short video's audio. Try a different short file.")
       }
       shortName = SHORT_FIXED
     } else if (!vOk) {
       // Fallback: convert ONLY the short to match the movie. Movie untouched.
       usedFallback = true
-      onStatus?.("Formats differ — converting only the short video to match the movie (movie stays original quality)...")
+      onStatus?.(
+        engine.isMT
+          ? "Formats differ — fast multi-core conversion of the short video (movie stays original quality)..."
+          : "Formats differ — converting only the short video to match the movie (movie stays original quality)...",
+      )
       onProgress?.(8)
 
       const targetW = movieInfo.width ?? 1280
@@ -426,6 +468,10 @@ export async function mergeVideos(
         "-profile:v",
         targetProfile,
       )
+      if (engine.isMT) {
+        // Use every available CPU core for the encode (4-6x faster).
+        args.push("-threads", "0")
+      }
       if (movieHasAudio) {
         if (!shortHasAudio) {
           args.push("-map", "0:v:0", "-map", "1:a:0", "-shortest")
@@ -436,7 +482,7 @@ export async function mergeVideos(
       }
       args.push("-y", SHORT_FIXED)
 
-      const encodeRet = await execWithProgress(ff, args, {
+      const encodeRet = await execWithProgress(engine, args, {
         baseline: 8,
         span: 14,
         totalSec: shortInfo.durationSec,
@@ -444,7 +490,7 @@ export async function mergeVideos(
         onEta,
       })
       if (encodeRet !== 0) {
-        console.log("[v0] fallback encode failed, logs tail:", logBuffer.slice(-10).join(" | "))
+        console.log("[v0] fallback encode failed, logs tail:", engine.logBuffer.slice(-10).join(" | "))
         throw new Error("Could not convert the short video to match the movie format. Try a different short file.")
       }
       shortName = SHORT_FIXED
@@ -462,7 +508,7 @@ export async function mergeVideos(
     // Real progress: ffmpeg reports the output timestamp as it writes; we
     // compare against the known total duration for a true percentage + ETA.
     const concatRet = await execWithProgress(
-      ff,
+      engine,
       [
         "-f",
         "concat",
@@ -488,20 +534,20 @@ export async function mergeVideos(
       },
     )
     if (concatRet !== 0) {
-      console.log("[v0] concat failed, logs tail:", logBuffer.slice(-15).join(" | "))
+      console.log("[v0] concat failed, logs tail:", engine.logBuffer.slice(-15).join(" | "))
       throw new Error("Merging failed while joining the two videos. The files may be in an unsupported format.")
     }
 
     // Release inputs BEFORE reading the output to minimize peak memory.
-    await safeDelete(ff, SHORT_FIXED)
-    await safeDelete(ff, LIST_FILE)
-    await safeUnmount(ff)
+    await safeDelete(engine, SHORT_FIXED)
+    await safeDelete(engine, LIST_FILE)
+    await safeUnmount(engine)
 
     onStatus?.("Preparing download...")
     onProgress?.(92)
     const data = (await ff.readFile(OUTPUT)) as Uint8Array
     // Free the in-engine copy immediately — the bytes now live in `data`.
-    await safeDelete(ff, OUTPUT)
+    await safeDelete(engine, OUTPUT)
 
     if (data.byteLength === 0) {
       throw new Error("Merge produced an empty file. The inputs may be in an unsupported format.")
@@ -511,23 +557,12 @@ export async function mergeVideos(
     const blob = new Blob([data as BlobPart], { type: "video/mp4" })
     const url = URL.createObjectURL(blob)
 
-    // After a large merge, retire the engine entirely: WASM memory grows but
-    // never shrinks, so this hands the RAM back to the browser and keeps the
-    // tab stable for the next merge (engine reloads in ~1s next time).
-    if (data.byteLength > 512 * 1024 * 1024) {
-      destroyMergeFFmpeg()
-    }
-
     onProgress?.(100)
     onEta?.(null)
     onStatus?.("Done!")
 
-    return { url, sizeBytes: data.byteLength, usedFallback }
+    return { url, blob, sizeBytes: data.byteLength, usedFallback }
   } catch (err) {
-    failed = true
-    // A failed (possibly OOM'd) engine is unreliable — discard it completely
-    // so the page stays healthy and the next attempt starts fresh.
-    destroyMergeFFmpeg()
     if (isMemoryError(err)) {
       throw new Error(
         "The browser ran out of memory while merging these files. Close other tabs and try again, or use a slightly smaller movie file. (Browsers cap how much memory one page can use — this is a browser limit, not a bug.)",
@@ -535,12 +570,9 @@ export async function mergeVideos(
     }
     throw err
   } finally {
-    if (!failed && mergeFF) {
-      await safeDelete(mergeFF, SHORT_FIXED)
-      await safeDelete(mergeFF, LIST_FILE)
-      await safeDelete(mergeFF, OUTPUT)
-      await safeUnmount(mergeFF)
-    }
+    // Retire the engine after EVERY job — hands WASM memory back to the
+    // browser immediately, which is essential when jobs run in parallel.
+    destroyEngine(engine)
     onEta?.(null)
   }
 }
