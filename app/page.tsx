@@ -2,84 +2,45 @@
 
 import { useState } from "react"
 import { VideoUploader } from "@/components/video-uploader"
-import { ClipPreviewer } from "@/components/clip-previewer"
+import { ComparisonViewer } from "@/components/comparison-viewer"
 import { ExtractionPanel } from "@/components/extraction-panel"
 import { Button } from "@/components/ui/button"
-import { resolveClip, type Clip, type ResolvedClip } from "@/lib/timestamp"
+import { startBackgroundExtraction, resetBackground } from "@/lib/ffmpeg-client"
+import type { MappingPair, Verdict, ParsedReport } from "@/lib/report-parser"
 
-type Step = "upload" | "preview" | "process"
+type Step = "upload" | "compare" | "export"
 
 export default function Page() {
-  const [videoFile, setVideoFile] = useState<File | null>(null)
-  const [clips, setClips] = useState<ResolvedClip[]>([])
+  const [shortFile, setShortFile] = useState<File | null>(null)
+  const [movieFile, setMovieFile] = useState<File | null>(null)
+  const [pairs, setPairs] = useState<MappingPair[]>([])
+  const [verdict, setVerdict] = useState<Verdict | null>(null)
   const [step, setStep] = useState<Step>("upload")
-  const [parseError, setParseError] = useState<string | null>(null)
-  const [videoSource, setVideoSource] = useState<'short' | 'full'>('full')
 
-  const handleFilesSelected = (video: File, json: File, source: 'short' | 'full') => {
-    setParseError(null)
-    setVideoSource(source)
-    const reader = new FileReader()
-    reader.onload = (e) => {
-      try {
-        const raw = JSON.parse(e.target?.result as string)
-        const list: Clip[] = Array.isArray(raw) ? raw : raw.clips || raw.scenes || raw.segments || []
-        if (!list.length) {
-          setParseError("No clips found in the JSON. Expected an array of scenes or segments.")
-          return
-        }
-        
-        // Filter and map clips based on video source selection
-        let resolved: ResolvedClip[]
-        if (source === 'short') {
-          // For short videos, extract clips from shortStart and shortEnd
-          resolved = list
-            .filter((c) => c?.shortStart !== undefined && c?.shortEnd !== undefined)
-            .map((c, i) => {
-              // Convert short video times to the ResolvedClip format
-              const clipWithShortTime: Clip = {
-                ...c,
-                movieStart: c.shortStart,
-                movieEnd: c.shortEnd,
-              }
-              return resolveClip(clipWithShortTime, i)
-            })
-        } else {
-          // For full movies, extract clips from movieStart and movieEnd
-          resolved = list
-            .filter((c) => c?.movieStart !== undefined && c?.movieEnd !== undefined)
-            .map((c, i) => {
-              // Use movieStart and movieEnd directly
-              const clipWithMovieTime: Clip = {
-                ...c,
-                movieStart: c.movieStart,
-                movieEnd: c.movieEnd,
-              }
-              return resolveClip(clipWithMovieTime, i)
-            })
-        }
-        
-        if (!resolved.length) {
-          const fieldName = source === 'short' ? 'shortStart/shortEnd' : 'movieStart/movieEnd'
-          setParseError(`No clips found with ${fieldName} data for ${source === 'short' ? 'short video' : 'full movie'}.`)
-          return
-        }
-        
-        setVideoFile(video)
-        setClips(resolved)
-        setStep("preview")
-      } catch (error) {
-        console.error("[v0] JSON parsing error:", error)
-        setParseError("Failed to parse the JSON file. Make sure it is valid JSON.")
-      }
-    }
-    reader.readAsText(json)
+  const handleFilesSelected = (short: File, movie: File, report: ParsedReport) => {
+    resetBackground()
+    setShortFile(short)
+    setMovieFile(movie)
+    setPairs(report.pairs)
+    setVerdict(report.verdict)
+    setStep("compare")
+    // Kick off background cutting of movie clips while the user compares pairs.
+    startBackgroundExtraction(movie, report.pairs)
+  }
+
+  const handleRestart = () => {
+    resetBackground()
+    setShortFile(null)
+    setMovieFile(null)
+    setPairs([])
+    setVerdict(null)
+    setStep("upload")
   }
 
   const steps: { key: Step; title: string; desc: string }[] = [
-    { key: "upload", title: "1. Upload", desc: "Movie + JSON metadata" },
-    { key: "preview", title: "2. Preview Clips", desc: "Review matched segments" },
-    { key: "process", title: "3. Extract & Merge", desc: "Build the final video" },
+    { key: "upload", title: "1. Upload", desc: "Short + Movie + Report" },
+    { key: "compare", title: "2. Compare", desc: "Side-by-side pair preview" },
+    { key: "export", title: "3. Merge & Export", desc: "Build the final video" },
   ]
 
   const activeIndex = steps.findIndex((s) => s.key === step)
@@ -88,13 +49,13 @@ export default function Page() {
     <main className="min-h-screen bg-slate-950 p-4 md:p-8">
       <div className="mx-auto max-w-5xl">
         <header className="mb-8">
-          <h1 className="text-2xl md:text-3xl font-bold text-slate-50 text-balance">
-            Video Clip Extractor &amp; Merger
+          <h1 className="text-balance text-2xl font-bold text-slate-50 md:text-3xl">
+            Short vs Movie — Clip Matcher &amp; Exporter
           </h1>
-          <p className="mt-2 text-slate-400 text-pretty">
-            Upload a movie and its temporal-grounding JSON. The app reads each matched timestamp,
-            cuts the clip from the movie, then merges everything into a single previewable video —
-            all in your browser.
+          <p className="mt-2 text-pretty text-slate-400">
+            Upload the short video, the full movie, and the text analysis report. Compare every matched
+            segment side by side, then cut and merge the movie clips into one exportable video — all in
+            your browser.
           </p>
         </header>
 
@@ -117,54 +78,51 @@ export default function Page() {
         </nav>
 
         <div className="rounded-xl border border-slate-800 bg-slate-900 p-4 md:p-6">
-          {step === "upload" && (
-            <>
-              <VideoUploader onFilesSelected={handleFilesSelected} />
-              {parseError && (
-                <p className="mt-4 rounded-md border border-red-800 bg-red-950/50 p-3 text-sm text-red-300">
-                  {parseError}
-                </p>
-              )}
-            </>
-          )}
+          {step === "upload" && <VideoUploader onFilesSelected={handleFilesSelected} />}
 
-          {step === "preview" && (
+          {step === "compare" && shortFile && movieFile && (
             <div>
               <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <h2 className="text-lg font-semibold text-slate-100">
-                    {clips.length} clips detected
-                  </h2>
-                  <div className="space-y-1">
-                    <p className="text-sm text-slate-400">
-                      Video: <span className="text-slate-300">{videoFile?.name}</span>
-                    </p>
-                    <p className="text-sm text-slate-400">
-                      Type: <span className={`text-sm font-semibold ${videoSource === 'short' ? 'text-purple-400' : 'text-blue-400'}`}>
-                        {videoSource === 'short' ? '📹 Short Video' : '🎬 Full Movie'}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="text-lg font-semibold text-slate-100">
+                      {pairs.length} matched pairs
+                    </h2>
+                    {verdict?.verdict && (
+                      <span className="rounded bg-red-500/15 px-2 py-0.5 text-xs font-bold text-red-300">
+                        {verdict.verdict}
                       </span>
-                    </p>
+                    )}
+                    {verdict?.matched && (
+                      <span className="rounded bg-amber-500/15 px-2 py-0.5 text-xs font-semibold text-amber-300">
+                        MATCHED: {verdict.matched}
+                      </span>
+                    )}
                   </div>
+                  <p className="mt-1 text-sm text-slate-400">
+                    <span className="text-purple-300">{shortFile.name}</span> vs{" "}
+                    <span className="text-blue-300">{movieFile.name}</span>
+                  </p>
                 </div>
                 <div className="flex gap-2">
                   <Button
                     variant="outline"
-                    onClick={() => setStep("upload")}
+                    onClick={handleRestart}
                     className="border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
                   >
-                    Back
+                    Start Over
                   </Button>
-                  <Button onClick={() => setStep("process")} className="bg-blue-600 hover:bg-blue-500">
-                    Extract &amp; Merge
+                  <Button onClick={() => setStep("export")} className="bg-blue-600 hover:bg-blue-500">
+                    Merge &amp; Export
                   </Button>
                 </div>
               </div>
-              <ClipPreviewer clips={clips} />
+              <ComparisonViewer shortFile={shortFile} movieFile={movieFile} pairs={pairs} />
             </div>
           )}
 
-          {step === "process" && videoFile && (
-            <ExtractionPanel videoFile={videoFile} clips={clips} onBack={() => setStep("preview")} />
+          {step === "export" && movieFile && (
+            <ExtractionPanel movieFile={movieFile} pairs={pairs} onBack={() => setStep("compare")} />
           )}
         </div>
       </div>

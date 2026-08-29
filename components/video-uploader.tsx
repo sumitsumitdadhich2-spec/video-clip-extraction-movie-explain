@@ -1,280 +1,216 @@
-'use client'
+"use client"
 
-import { useState, useRef } from 'react'
-import { Button } from './ui/button'
+import { useRef, useState } from "react"
+import { Button } from "@/components/ui/button"
+import { parseReport, type ParsedReport } from "@/lib/report-parser"
 
 interface VideoUploaderProps {
-  onFilesSelected: (video: File, json: File, source: 'short' | 'full') => void
+  onFilesSelected: (shortFile: File, movieFile: File, report: ParsedReport) => void
 }
 
+const EXAMPLE_LINE =
+  "Short 00:41.000 [f984] - 00:44.000 [f1056] --> Movie 04:14.000 [f3216] - 04:17.000 [f3288] | EXACT | HIGH | Ryan's baby"
+
 export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
-  const [videoFile, setVideoFile] = useState<File | null>(null)
-  const [jsonFile, setJsonFile] = useState<File | null>(null)
-  const [dragActive, setDragActive] = useState(false)
-  const [videoSource, setVideoSource] = useState<'short' | 'full'>('full')
-  const [jsonMode, setJsonMode] = useState<'upload' | 'paste'>('upload')
-  const [pastedJson, setPastedJson] = useState('')
-  const [pasteError, setPasteError] = useState('')
+  const [shortFile, setShortFile] = useState<File | null>(null)
+  const [movieFile, setMovieFile] = useState<File | null>(null)
+  const [reportMode, setReportMode] = useState<"paste" | "upload">("paste")
+  const [reportText, setReportText] = useState("")
+  const [parsed, setParsed] = useState<ParsedReport | null>(null)
+  const [reportFileName, setReportFileName] = useState<string | null>(null)
 
-  const videoInputRef = useRef<HTMLInputElement>(null)
-  const jsonInputRef = useRef<HTMLInputElement>(null)
+  const shortInputRef = useRef<HTMLInputElement>(null)
+  const movieInputRef = useRef<HTMLInputElement>(null)
+  const reportInputRef = useRef<HTMLInputElement>(null)
 
-  const handleDrag = (e: React.DragEvent) => {
-    e.preventDefault()
-    e.stopPropagation()
-    if (e.type === 'dragenter' || e.type === 'dragover') setDragActive(true)
-    else if (e.type === 'dragleave') setDragActive(false)
-  }
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault()
-    e.stopPropagation()
-    setDragActive(false)
-    const files = e.dataTransfer.files
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i]
-      if (file.type.startsWith('video/')) setVideoFile(file)
-      else if (file.type === 'application/json' || file.name.endsWith('.json')) setJsonFile(file)
-    }
-  }
-
-  const handleVideoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files?.[0]) setVideoFile(e.target.files[0])
-  }
-
-  const handleJsonChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files?.[0]) setJsonFile(e.target.files[0])
-  }
-
-  const handlePasteChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const val = e.target.value
-    setPastedJson(val)
-    setPasteError('')
-    if (!val.trim()) {
-      setJsonFile(null)
+  const handleReportText = (text: string) => {
+    setReportText(text)
+    if (!text.trim()) {
+      setParsed(null)
       return
     }
-    try {
-      JSON.parse(val)
-      const blob = new Blob([val], { type: 'application/json' })
-      const file = new File([blob], 'clips.json', { type: 'application/json' })
-      setJsonFile(file)
-      setPasteError('')
-    } catch {
-      setJsonFile(null)
-      setPasteError('Invalid JSON — please check the format.')
+    setParsed(parseReport(text))
+  }
+
+  const handleReportFile = (file: File) => {
+    setReportFileName(file.name)
+    const reader = new FileReader()
+    reader.onload = (e) => handleReportText((e.target?.result as string) || "")
+    reader.readAsText(file)
+  }
+
+  const pairCount = parsed?.pairs.length ?? 0
+  const reportReady = pairCount > 0
+  const ready = !!shortFile && !!movieFile && reportReady
+
+  const handleContinue = () => {
+    if (shortFile && movieFile && parsed && parsed.pairs.length > 0) {
+      onFilesSelected(shortFile, movieFile, parsed)
     }
   }
 
-  const handleContinue = () => {
-    if (videoFile && jsonFile) onFilesSelected(videoFile, jsonFile, videoSource)
-  }
-
-  const jsonReady = jsonMode === 'upload' ? !!jsonFile : !!jsonFile && !pasteError
+  const videoZone = (
+    label: string,
+    accent: string,
+    file: File | null,
+    inputRef: React.RefObject<HTMLInputElement | null>,
+    onChange: (f: File) => void,
+  ) => (
+    <div className="rounded-lg bg-slate-800 p-5">
+      <span className="mb-3 block text-sm font-semibold text-slate-200">{label}</span>
+      <input
+        ref={inputRef}
+        type="file"
+        accept="video/*"
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files?.[0]) onChange(e.target.files[0])
+        }}
+      />
+      <div
+        onClick={() => inputRef.current?.click()}
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => {
+          e.preventDefault()
+          const f = e.dataTransfer.files?.[0]
+          if (f && f.type.startsWith("video/")) onChange(f)
+        }}
+        className={`cursor-pointer rounded border-2 border-dashed p-6 text-center transition hover:bg-slate-700/60 ${
+          file ? "border-emerald-600 bg-emerald-950/20" : `${accent} bg-slate-700/40`
+        }`}
+      >
+        {file ? (
+          <>
+            <p className="text-sm font-semibold text-emerald-300">{file.name}</p>
+            <p className="mt-1 text-xs text-slate-400">{(file.size / (1024 * 1024)).toFixed(2)} MB</p>
+          </>
+        ) : (
+          <p className="text-sm text-slate-300">Click or drop video here</p>
+        )}
+      </div>
+    </div>
+  )
 
   return (
     <div className="space-y-6">
-      {/* Video Source Selection */}
-      <div className="bg-slate-800 p-4 rounded-lg border border-slate-700">
-        <label className="text-slate-200 font-semibold text-sm block mb-3">
-          What type of video are you extracting clips from?
-        </label>
-        <div className="flex gap-3">
-          <button
-            type="button"
-            onClick={() => setVideoSource('short')}
-            className={`flex-1 py-3 px-4 rounded-lg border-2 transition font-semibold text-sm ${
-              videoSource === 'short'
-                ? 'border-blue-500 bg-blue-600 text-white'
-                : 'border-slate-600 bg-slate-700 text-slate-300 hover:bg-slate-600'
-            }`}
-          >
-            📹 Short Video Clip
-          </button>
-          <button
-            type="button"
-            onClick={() => setVideoSource('full')}
-            className={`flex-1 py-3 px-4 rounded-lg border-2 transition font-semibold text-sm ${
-              videoSource === 'full'
-                ? 'border-blue-500 bg-blue-600 text-white'
-                : 'border-slate-600 bg-slate-700 text-slate-300 hover:bg-slate-600'
-            }`}
-          >
-            🎬 Full Movie
-          </button>
-        </div>
-        <p className="text-xs text-slate-400 mt-3">
-          {videoSource === 'short'
-            ? 'Upload a short video file and JSON data to extract and merge matching scenes.'
-            : 'Upload a full movie file and JSON data to extract matching clips and merge them.'}
-        </p>
+      {/* Dual video upload */}
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        {videoZone("Short Video (the clip to verify)", "border-purple-600/60", shortFile, shortInputRef, setShortFile)}
+        {videoZone("Movie File (the full source)", "border-blue-600/60", movieFile, movieInputRef, setMovieFile)}
       </div>
 
-      <div
-        onDragEnter={handleDrag}
-        onDragLeave={handleDrag}
-        onDragOver={handleDrag}
-        onDrop={handleDrop}
-        className={`border-2 border-dashed rounded-lg p-6 transition ${
-          dragActive ? 'border-blue-400 bg-blue-900/20' : 'border-slate-600'
-        }`}
-      >
-        <p className="text-slate-400 text-sm text-center mb-5">
-          Drag and drop files here, or use the options below
-        </p>
+      {/* Analysis report */}
+      <div className="rounded-lg bg-slate-800 p-5">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <span className="block text-sm font-semibold text-slate-200">Analysis Report</span>
+            <p className="mt-1 text-xs text-slate-400">
+              Paste the text report — mappings are read from the HISSA 2 section.
+            </p>
+          </div>
+          <div className="flex overflow-hidden rounded border border-slate-600 text-xs">
+            <button
+              type="button"
+              onClick={() => setReportMode("paste")}
+              className={`px-3 py-1 transition ${
+                reportMode === "paste" ? "bg-blue-600 text-white" : "bg-slate-700 text-slate-300 hover:bg-slate-600"
+              }`}
+            >
+              Paste
+            </button>
+            <button
+              type="button"
+              onClick={() => setReportMode("upload")}
+              className={`px-3 py-1 transition ${
+                reportMode === "upload" ? "bg-blue-600 text-white" : "bg-slate-700 text-slate-300 hover:bg-slate-600"
+              }`}
+            >
+              Upload .txt
+            </button>
+          </div>
+        </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-          {/* Video File Upload */}
-          <div className="bg-slate-700 p-5 rounded-lg">
-            <span className="text-slate-200 font-semibold text-sm mb-3 block">
-              {videoSource === 'full' ? '🎬 Movie File' : '📹 Video File'} (MP4, MKV, AVI, etc.)
-            </span>
+        {reportMode === "paste" ? (
+          <textarea
+            value={reportText}
+            onChange={(e) => handleReportText(e.target.value)}
+            placeholder={`Paste the full analysis report here...\n\nMapping lines look like:\n${EXAMPLE_LINE}`}
+            rows={8}
+            spellCheck={false}
+            className={`w-full resize-none rounded border bg-slate-900 p-3 font-mono text-xs text-slate-200 outline-none transition ${
+              reportText && !reportReady
+                ? "border-red-500 focus:border-red-400"
+                : reportReady
+                  ? "border-emerald-600 focus:border-emerald-500"
+                  : "border-slate-600 focus:border-blue-500"
+            }`}
+          />
+        ) : (
+          <>
             <input
-              ref={videoInputRef}
+              ref={reportInputRef}
               type="file"
-              accept="video/*"
-              onChange={handleVideoChange}
+              accept=".txt,.log,.md,text/plain"
               className="hidden"
+              onChange={(e) => {
+                if (e.target.files?.[0]) handleReportFile(e.target.files[0])
+              }}
             />
             <div
-              onClick={() => videoInputRef.current?.click()}
-              className="bg-slate-600 hover:bg-slate-500 cursor-pointer p-4 rounded border border-slate-500 transition text-center"
+              onClick={() => reportInputRef.current?.click()}
+              className="cursor-pointer rounded border border-slate-600 bg-slate-700/50 p-4 text-center transition hover:bg-slate-700"
             >
-              <p className="text-slate-300 text-sm">Click to select video</p>
+              <p className="text-sm text-slate-300">
+                {reportFileName ? reportFileName : "Click to select report file (.txt)"}
+              </p>
             </div>
-            {videoFile && (
-              <div className="mt-3 p-3 bg-green-900/30 rounded border border-green-700">
-                <p className="text-green-300 text-sm font-semibold">{videoFile.name}</p>
-                <p className="text-slate-400 text-xs">{(videoFile.size / (1024 * 1024)).toFixed(2)} MB</p>
-              </div>
-            )}
-          </div>
+          </>
+        )}
 
-          {/* JSON — Upload or Paste toggle */}
-          <div className="bg-slate-700 p-5 rounded-lg">
-            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-3">
-              <div>
-                <span className="text-slate-200 font-semibold text-sm block">📋 Metadata (JSON, TXT, etc.)</span>
-                <p className="text-xs text-slate-400 mt-1">Any file format containing JSON data</p>
-              </div>
-              {/* Toggle buttons */}
-              <div className="flex rounded overflow-hidden border border-slate-500 text-xs flex-shrink-0">
-                <button
-                  type="button"
-                  onClick={() => { setJsonMode('upload'); setPasteError('') }}
-                  className={`px-3 py-1 transition whitespace-nowrap ${
-                    jsonMode === 'upload'
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-slate-600 text-slate-300 hover:bg-slate-500'
-                  }`}
-                >
-                  Upload
-                </button>
-                <button
-                  type="button"
-                  onClick={() => { setJsonMode('paste'); setPasteError('') }}
-                  className={`px-3 py-1 transition whitespace-nowrap ${
-                    jsonMode === 'paste'
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-slate-600 text-slate-300 hover:bg-slate-500'
-                  }`}
-                >
-                  Paste
-                </button>
-              </div>
-            </div>
-
-            {jsonMode === 'upload' ? (
-              <>
-                <input
-                  ref={jsonInputRef}
-                  type="file"
-                  accept=".json,.txt,.csv,*"
-                  onChange={handleJsonChange}
-                  className="hidden"
-                />
-                <div
-                  onClick={() => jsonInputRef.current?.click()}
-                  className="bg-slate-600 hover:bg-slate-500 cursor-pointer p-4 rounded border border-slate-500 transition text-center"
-                >
-                  <p className="text-slate-300 text-sm">Click to select file (JSON, TXT, etc.)</p>
-                </div>
-                {jsonFile && (
-                  <div className="mt-3 p-3 bg-green-900/30 rounded border border-green-700">
-                    <p className="text-green-300 text-sm font-semibold">{jsonFile.name}</p>
-                    <p className="text-slate-400 text-xs">{(jsonFile.size / 1024).toFixed(2)} KB</p>
-                  </div>
-                )}
-              </>
+        {/* Live validation */}
+        {(reportText || reportFileName) && (
+          <div className="mt-2 text-xs">
+            {reportReady ? (
+              <p className="text-emerald-400">
+                {pairCount} mapping{pairCount === 1 ? "" : "s"} found
+                {parsed?.verdict.verdict ? ` — Verdict: ${parsed.verdict.verdict}` : ""}
+                {parsed?.verdict.matched ? ` (${parsed.verdict.matched})` : ""}
+              </p>
             ) : (
-              <>
-                <textarea
-                  value={pastedJson}
-                  onChange={handlePasteChange}
-                  placeholder={'[\n  {\n    "short_video_clip": "Scene_01",\n    "matched_in_movie": { ... }\n  }\n]'}
-                  rows={7}
-                  spellCheck={false}
-                  className={`w-full bg-slate-800 text-slate-200 text-xs font-mono p-3 rounded border resize-none outline-none transition ${
-                    pasteError
-                      ? 'border-red-500 focus:border-red-400'
-                      : pastedJson && !pasteError
-                      ? 'border-green-600 focus:border-green-500'
-                      : 'border-slate-500 focus:border-blue-500'
-                  }`}
-                />
-                {pasteError && (
-                  <p className="text-red-400 text-xs mt-1">{pasteError}</p>
-                )}
-                {jsonFile && !pasteError && pastedJson && (
-                  <p className="text-green-400 text-xs mt-1">
-                    {(() => {
-                      try {
-                        const parsed = JSON.parse(pastedJson)
-                        const count = Array.isArray(parsed) ? parsed.length : parsed.clips?.length || parsed.scenes?.length || parsed.segments?.length || 0
-                        return `Valid JSON — ${count} clip(s) found`
-                      } catch {
-                        return 'Valid JSON'
-                      }
-                    })()}
-                  </p>
-                )}
-              </>
+              <p className="text-red-400">
+                No mapping lines found. Expected HISSA 2 lines like: <br />
+                <code className="text-slate-400">{EXAMPLE_LINE}</code>
+              </p>
             )}
           </div>
-        </div>
+        )}
+      </div>
 
-        <div className="flex justify-center mt-6">
-          <Button
-            onClick={handleContinue}
-            disabled={!videoFile || !jsonReady}
-            className="px-8 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-600 disabled:cursor-not-allowed"
-          >
-            Continue to Preview
-          </Button>
-        </div>
+      <div className="flex justify-center">
+        <Button
+          onClick={handleContinue}
+          disabled={!ready}
+          className="bg-blue-600 px-8 hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-slate-600"
+        >
+          Continue to Compare
+        </Button>
       </div>
 
       {/* Format reference */}
-      <div className="bg-slate-700 p-4 rounded-lg">
-        <h3 className="text-slate-200 font-semibold text-sm mb-2">📝 Expected JSON Format</h3>
-        <p className="text-xs text-slate-400 mb-2">
-          Your metadata file (JSON, TXT, etc.) should contain JSON data with clip segments. 
-          Timestamps are <code className="text-slate-300">MM:SS:FF</code> (minutes : seconds : frames) at the given <code className="text-slate-300">fps_match</code>.
+      <div className="rounded-lg bg-slate-800/60 p-4">
+        <h3 className="mb-2 text-sm font-semibold text-slate-200">Expected Report Format</h3>
+        <p className="mb-2 text-xs text-slate-400">
+          The report contains HISSA 0/1/2 sections and a FINAL VERDICT. Only HISSA 2 mapping lines are used for
+          extraction — one line per matched segment:
         </p>
-        <pre className="bg-slate-800 p-3 rounded text-xs text-slate-300 overflow-x-auto leading-relaxed">
-{`[
-  {
-    "short_video_clip": "Scene_01",
-    "matched_in_movie": {
-      "movie_name": "1000171613.mp4",
-      "start_timestamp": "00:01:16",
-      "end_timestamp": "00:03:03",
-      "confidence": "87.9%",
-      "fps_match": 24,
-      "total_matching_frames": 33
-    }
-  }
-]`}
+        <pre className="overflow-x-auto rounded bg-slate-900 p-3 text-xs leading-relaxed text-slate-300">
+          {`=== HISSA 2: MAPPING ===
+${EXAMPLE_LINE}
+Short 00:44.000 [f1056] - 00:48.000 [f1152] --> Movie 05:02.000 [f7248] - 05:06.000 [f7344] | EXACT | HIGH | Hospital scene
+
+=== FINAL VERDICT ===
+MATCHED: 94%
+VERDICT: COPIED`}
         </pre>
       </div>
     </div>
