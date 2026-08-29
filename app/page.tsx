@@ -4,7 +4,7 @@ import { useState } from "react"
 import Link from "next/link"
 import { MergeUploader } from "@/components/merge-uploader"
 import { Button } from "@/components/ui/button"
-import { mergeVideos, totalSizeOk, formatBytes, MAX_TOTAL_BYTES, type MergeResult } from "@/lib/merge-client"
+import { mergeVideos, totalSizeOk, formatBytes, formatEta, MAX_TOTAL_BYTES, type MergeResult } from "@/lib/merge-client"
 
 type Phase = "idle" | "merging" | "done" | "error"
 
@@ -14,6 +14,7 @@ export default function Page() {
   const [phase, setPhase] = useState<Phase>("idle")
   const [status, setStatus] = useState("")
   const [progress, setProgress] = useState(0)
+  const [eta, setEta] = useState<number | null>(null)
   const [result, setResult] = useState<MergeResult | null>(null)
   const [errorMsg, setErrorMsg] = useState("")
 
@@ -25,11 +26,13 @@ export default function Page() {
     setPhase("merging")
     setErrorMsg("")
     setProgress(0)
+    setEta(null)
 
     try {
       const merged = await mergeVideos(shortFile, movieFile, {
         onStatus: setStatus,
         onProgress: setProgress,
+        onEta: setEta,
       })
       setResult(merged)
       setPhase("done")
@@ -52,6 +55,7 @@ export default function Page() {
     setPhase("idle")
     setStatus("")
     setProgress(0)
+    setEta(null)
     setErrorMsg("")
   }
 
@@ -112,9 +116,14 @@ export default function Page() {
 
                 {phase === "merging" && (
                   <div>
-                    <div className="mb-2 flex items-center justify-between text-sm">
-                      <span className="text-slate-300">{status}</span>
-                      <span className="font-mono text-slate-400">{progress}%</span>
+                    <div className="mb-2 flex items-center justify-between gap-3 text-sm">
+                      <span className="min-w-0 flex-1 truncate text-slate-300">{status}</span>
+                      <span className="shrink-0 font-mono text-slate-400">
+                        {eta !== null && eta > 0 && (
+                          <span className="mr-3 text-slate-500">~{formatEta(eta)} left</span>
+                        )}
+                        {progress}%
+                      </span>
                     </div>
                     <div className="h-2 overflow-hidden rounded-full bg-slate-800">
                       <div
