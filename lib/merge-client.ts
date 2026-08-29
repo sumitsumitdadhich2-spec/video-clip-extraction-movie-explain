@@ -100,21 +100,23 @@ async function probeFile(ff: FFmpeg, name: string): Promise<StreamInfo> {
   return parseStreamInfo(logBuffer)
 }
 
-function fpsClose(a: number | null, b: number | null): boolean {
-  if (a === null || b === null) return false
-  return Math.abs(a - b) < 0.05
-}
-
-function streamsCompatible(a: StreamInfo, b: StreamInfo): boolean {
+// Video streams can be stream-copied together as long as codec + resolution
+// match. FPS does NOT need to match — h264/h265 timestamps are per-packet,
+// so mixed frame rates play back correctly after concat.
+function videoCompatible(a: StreamInfo, b: StreamInfo): boolean {
   return (
     a.videoCodec !== null &&
     a.videoCodec === b.videoCodec &&
     a.width === b.width &&
-    a.height === b.height &&
-    fpsClose(a.fps, b.fps) &&
-    a.audioCodec === b.audioCodec &&
-    a.sampleRate === b.sampleRate
+    a.height === b.height
   )
+}
+
+// Audio needs matching codec + sample rate for a clean copy-concat
+// (a sample-rate switch mid-stream plays at the wrong pitch in most players).
+function audioCompatible(a: StreamInfo, b: StreamInfo): boolean {
+  if (a.audioCodec === null && b.audioCodec === null) return true
+  return a.audioCodec === b.audioCodec && a.sampleRate === b.sampleRate
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +186,41 @@ export async function mergeVideos(
     let shortName = SHORT_IN
     let usedFallback = false
 
-    if (!streamsCompatible(shortInfo, movieInfo)) {
+    const vOk = videoCompatible(shortInfo, movieInfo)
+    const aOk = audioCompatible(shortInfo, movieInfo)
+
+    if (vOk && !aOk) {
+      // FAST PATH: video matches — copy it bit-for-bit, convert ONLY the
+      // short's tiny audio track. Takes a second or two even for long shorts.
+      usedFallback = true
+      onStatus?.("Video formats match — fixing only the short's audio track (video untouched)...")
+      onProgress?.(50)
+
+      const targetSR = movieInfo.sampleRate ? String(movieInfo.sampleRate) : "44100"
+      const movieHasAudio = movieInfo.audioCodec !== null
+      const shortHasAudio = shortInfo.audioCodec !== null
+
+      const args: string[] = ["-i", SHORT_IN]
+      if (movieHasAudio && !shortHasAudio) {
+        args.push("-f", "lavfi", "-i", `anullsrc=r=${targetSR}:cl=stereo`)
+        args.push("-map", "0:v:0", "-map", "1:a:0", "-shortest")
+      }
+      args.push("-c:v", "copy")
+      if (movieHasAudio) {
+        args.push("-c:a", "aac", "-ar", targetSR, "-ac", "2")
+      } else {
+        args.push("-an")
+      }
+      args.push("-y", SHORT_FIXED)
+
+      logBuffer = []
+      const audioRet = await ff.exec(args)
+      if (audioRet !== 0) {
+        console.log("[v0] audio-only fix failed, logs tail:", logBuffer.slice(-10).join(" | "))
+        throw new Error("Could not adapt the short video's audio. Try a different short file.")
+      }
+      shortName = SHORT_FIXED
+    } else if (!vOk) {
       // Fallback: convert ONLY the short to match the movie. Movie untouched.
       usedFallback = true
       onStatus?.("Formats differ — converting only the short video to match the movie (movie stays original quality)...")
@@ -221,9 +257,9 @@ export async function mergeVideos(
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        "ultrafast",
         "-crf",
-        "20",
+        "18",
         "-profile:v",
         targetProfile,
       )
