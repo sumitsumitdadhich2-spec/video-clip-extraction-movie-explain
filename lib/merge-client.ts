@@ -245,6 +245,21 @@ export function formatEta(seconds: number): string {
   return `${h}h ${(m % 60).toString().padStart(2, "0")}m`
 }
 
+/** A user-selected section of the movie (Part B): only this range is merged. */
+export interface MovieTrim {
+  startSec: number
+  endSec: number
+}
+
+/** Formats seconds as HH:MM:SS (e.g. 7290 → "02:01:30"). */
+export function formatTimecode(totalSec: number): string {
+  const s = Math.max(0, Math.round(totalSec))
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
+}
+
 // ---------------------------------------------------------------------------
 // Segmented, resumable merge
 // ---------------------------------------------------------------------------
@@ -443,6 +458,7 @@ export async function processMergeInSegments(
   movieFile: File,
   handlers: SegmentedMergeHandlers = {},
   resume?: ResumeOptions,
+  movieTrim?: MovieTrim | null,
 ): Promise<MergeResult> {
   const { onStatus, onProcessProgress: onProgress, onEta, onPlan, onSegmentReady } = handlers
 
@@ -479,11 +495,27 @@ export async function processMergeInSegments(
     onProgress?.(6)
     const movieInfo = await probeFile(engine, MOVIE_IN)
 
+    // Validate + clamp the trim against the movie's REAL duration. A trim
+    // that covers (almost) the whole movie is treated as "no trim" so the
+    // concat list stays byte-identical to the untrimmed path.
+    let trim: MovieTrim | null = null
+    if (movieTrim && movieInfo.durationSec !== null) {
+      const start = Math.max(0, Math.min(movieTrim.startSec, movieInfo.durationSec))
+      const end = Math.max(0, Math.min(movieTrim.endSec, movieInfo.durationSec))
+      if (end > start && (start > 0.5 || end < movieInfo.durationSec - 0.5)) {
+        trim = { startSec: start, endSec: end }
+      }
+    } else if (movieTrim && movieTrim.endSec > movieTrim.startSec) {
+      // Duration unknown (rare) — trust the user's values as-is.
+      trim = { startSec: Math.max(0, movieTrim.startSec), endSec: movieTrim.endSec }
+    }
+
+    // The movie length that actually ends up in the output.
+    const movieOutSec = trim ? trim.endSec - trim.startSec : movieInfo.durationSec
+
     // Total output duration — the base for the segment plan + accurate progress.
     const totalDurationSec =
-      shortInfo.durationSec !== null && movieInfo.durationSec !== null
-        ? shortInfo.durationSec + movieInfo.durationSec
-        : null
+      shortInfo.durationSec !== null && movieOutSec !== null ? shortInfo.durationSec + movieOutSec : null
 
     let shortName = SHORT_IN
     let usedFallback = false
@@ -608,7 +640,13 @@ export async function processMergeInSegments(
       shortName = SHORT_FIXED
     }
 
-    await ff.writeFile(LIST_FILE, new TextEncoder().encode(`file '${shortName}'\nfile '${MOVIE_IN}'`))
+    // Concat list — when a trim is set, `inpoint`/`outpoint` limit the movie
+    // to the selected range INSIDE the same single stream-copy pass (zero
+    // extra steps, zero re-encoding; cuts land on the nearest keyframe).
+    const movieEntry = trim
+      ? `file '${MOVIE_IN}'\ninpoint ${trim.startSec.toFixed(3)}\noutpoint ${trim.endSec.toFixed(3)}`
+      : `file '${MOVIE_IN}'`
+    await ff.writeFile(LIST_FILE, new TextEncoder().encode(`file '${shortName}'\n${movieEntry}`))
 
     // --- Segment plan ------------------------------------------------------
     // Only worth segmenting when the output is meaningfully longer than one
