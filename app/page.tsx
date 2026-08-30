@@ -28,7 +28,13 @@ import {
   finalPathname,
   type JobManifest,
 } from "@/lib/resumable"
-import { fetchPartBlob, fetchHistory, consolidateJob, STORAGE_QUOTA_BYTES } from "@/lib/history-client"
+import {
+  fetchPartBlob,
+  fetchHistory,
+  consolidateJob,
+  isBlobConnected,
+  STORAGE_QUOTA_BYTES,
+} from "@/lib/history-client"
 import { useHistory } from "@/components/history-panel"
 
 type JobPhase = "merging" | "done" | "error"
@@ -55,6 +61,8 @@ interface MergeJob {
   savingInBackground: boolean
   /** True if any part exhausted its 3 upload retries (merge still completes). */
   uploadsFailed: boolean
+  /** True when Blob storage isn't connected — cloud saving was skipped entirely. */
+  cloudSkipped: boolean
 }
 
 interface JobUploadState {
@@ -98,7 +106,10 @@ export default function Page() {
       return {
         processPercent: proc,
         uploadedSegments: uploaded,
-        progress: Math.min(100, Math.round(proc * 0.75 + uploadPct * 0.25)),
+        // No cloud saving → processing IS the whole bar.
+        progress: j.cloudSkipped
+          ? Math.min(100, Math.round(proc))
+          : Math.min(100, Math.round(proc * 0.75 + uploadPct * 0.25)),
       }
     })
   }
@@ -195,6 +206,7 @@ export default function Page() {
         uploadedSegments: resumeFrom?.completedSegments.length ?? 0,
         savingInBackground: false,
         uploadsFailed: false,
+        cloudSkipped: false,
       },
       ...prev,
     ])
@@ -205,6 +217,11 @@ export default function Page() {
       try {
         fingerprint = resumeFrom?.fingerprint ?? (await computeFingerprint(a, b, trim))
         updateJob(id, { fingerprint })
+
+        // Blob storage not connected → skip ALL cloud saving. The merge and
+        // the local download work exactly the same, just without History.
+        const cloudEnabled = await isBlobConnected()
+        if (!cloudEnabled) updateJob(id, { cloudSkipped: true })
 
         const manifest: JobManifest = resumeFrom ?? {
           fingerprint,
@@ -218,7 +235,7 @@ export default function Page() {
         }
         const state: JobUploadState = { manifest, pending: [], failed: false }
         uploadStates.current.set(id, state)
-        saveManifest(manifest)
+        if (cloudEnabled) saveManifest(manifest)
 
         const result = await processMergeInSegments(
           a,
@@ -237,10 +254,12 @@ export default function Page() {
               state.manifest.totalSegments = plan.totalSegments
               state.manifest.segmentDurationSec = plan.segmentDurationSec
               state.manifest.totalDurationSec = plan.totalDurationSec
-              saveManifest(state.manifest)
+              if (cloudEnabled) saveManifest(state.manifest)
               updateJob(id, { totalSegments: plan.totalSegments })
             },
             onSegmentReady: (index, data) => {
+              // Blob not connected → skip saving this part entirely.
+              if (!cloudEnabled) return
               // Fire-and-forget: the upload runs WHILE the next segment is
               // still processing. Never blocks or breaks the merge.
               const p = uploadWithRetry(partPathname(fingerprint, index), data, "video/mp4")
@@ -280,9 +299,15 @@ export default function Page() {
           localUrl: result.url,
           sizeBytes: result.sizeBytes,
           usedFallback: result.usedFallback,
-          savingInBackground: true,
+          savingInBackground: cloudEnabled,
           eta: null,
         })
+
+        if (!cloudEnabled) {
+          // Nothing was (or will be) saved — finish here.
+          updateJob(id, { savingInBackground: false, progress: 100 })
+          return
+        }
 
         await Promise.allSettled(state.pending)
 
@@ -449,7 +474,9 @@ export default function Page() {
                         {job.usedFallback
                           ? " — short converted to match movie format (movie kept original quality)"
                           : " — pure stream copy, 100% original quality"}
-                        {!job.savingInBackground && !job.uploadsFailed && " · Saved to History"}
+                        {job.cloudSkipped
+                          ? " · Cloud save skipped (storage not connected)"
+                          : !job.savingInBackground && !job.uploadsFailed && " · Saved to History"}
                       </p>
                     )}
                   </div>
@@ -469,7 +496,7 @@ export default function Page() {
                   <div className="mt-3">
                     <div className="mb-2 flex items-center justify-between gap-3 text-sm">
                       <span className="min-w-0 flex-1 truncate text-slate-300">
-                        Merging + Saving — {job.status}
+                        {job.cloudSkipped ? "Merging" : "Merging + Saving"} — {job.status}
                       </span>
                       <span className="shrink-0 font-mono text-slate-400">
                         {job.eta !== null && job.eta > 0 && (
@@ -484,11 +511,18 @@ export default function Page() {
                         style={{ width: `${job.progress}%` }}
                       />
                     </div>
-                    {job.totalSegments !== null && job.totalSegments > 1 && (
+                    {job.cloudSkipped ? (
                       <p className="mt-1.5 text-xs text-slate-500">
-                        {job.uploadedSegments}/{job.totalSegments} parts saved to cloud (uploads run alongside
-                        the merge)
+                        Cloud storage not connected — saving skipped, download will still work
                       </p>
+                    ) : (
+                      job.totalSegments !== null &&
+                      job.totalSegments > 1 && (
+                        <p className="mt-1.5 text-xs text-slate-500">
+                          {job.uploadedSegments}/{job.totalSegments} parts saved to cloud (uploads run
+                          alongside the merge)
+                        </p>
+                      )
                     )}
                   </div>
                 )}

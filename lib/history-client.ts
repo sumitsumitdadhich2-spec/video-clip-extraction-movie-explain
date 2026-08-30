@@ -34,6 +34,24 @@ export interface HistoryData {
 /** Blob storage quota shown to the user (10GB plan). */
 export const STORAGE_QUOTA_BYTES = 10 * 1024 * 1024 * 1024
 
+// Cached "is Blob storage connected?" check. When Blob isn't connected,
+// all cloud saving is SKIPPED — merging and downloading keep working.
+let blobConnectedCache: boolean | null = null
+
+export async function isBlobConnected(): Promise<boolean> {
+  if (blobConnectedCache !== null) return blobConnectedCache
+  try {
+    const res = await fetch("/api/history/status")
+    if (!res.ok) throw new Error("status check failed")
+    const data = (await res.json()) as { connected?: boolean }
+    blobConnectedCache = data.connected === true
+  } catch {
+    // Can't reach the status endpoint — assume not connected and skip saving.
+    blobConnectedCache = false
+  }
+  return blobConnectedCache
+}
+
 export async function fetchHistory(): Promise<HistoryData> {
   const res = await fetch("/api/history")
   if (!res.ok) throw new Error("Failed to load history")
