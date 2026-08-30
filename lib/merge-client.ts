@@ -280,6 +280,16 @@ export interface SegmentedMergeHandlers {
   onSegmentReady?: (index: number, data: Blob) => void
 }
 
+export interface ResumeOptions {
+  /** Segment indices already uploaded by a previous (interrupted) run. */
+  completedSegments: number[]
+  /** The interrupted job's segment count — resume only applies when the
+   * fresh plan produces the SAME count (deterministic for identical files). */
+  expectedTotalSegments: number
+  /** Downloads an already-uploaded part so it can be reused locally. */
+  fetchPart: (index: number) => Promise<Blob>
+}
+
 // Inputs are MOUNTED (read directly from disk by ffmpeg — never copied into
 // memory), which is what makes 2-3GB movies workable in the browser.
 const MOUNT_DIR = "/merge_in"
