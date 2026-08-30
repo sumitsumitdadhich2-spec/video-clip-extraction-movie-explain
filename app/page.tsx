@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { useSWRConfig } from "swr"
 import { MergeUploader } from "@/components/merge-uploader"
+import { MovieTrimmer } from "@/components/movie-trimmer"
 import { HistoryPanel } from "@/components/history-panel"
 import { Button } from "@/components/ui/button"
 import {
@@ -11,8 +12,10 @@ import {
   totalSizeOk,
   formatBytes,
   formatEta,
+  formatTimecode,
   MAX_TOTAL_BYTES,
   SEGMENT_DURATION_SEC,
+  type MovieTrim,
 } from "@/lib/merge-client"
 import {
   computeFingerprint,
@@ -65,6 +68,7 @@ let nextJobId = 1
 export default function Page() {
   const [shortFile, setShortFile] = useState<File | null>(null)
   const [movieFile, setMovieFile] = useState<File | null>(null)
+  const [movieTrim, setMovieTrim] = useState<MovieTrim | null>(null)
   const [jobs, setJobs] = useState<MergeJob[]>([])
   const [resumeCandidate, setResumeCandidate] = useState<JobManifest | null>(null)
   const { mutate } = useSWRConfig()
@@ -99,14 +103,19 @@ export default function Page() {
     })
   }
 
-  // --- Resume detection: same two files re-selected → offer to resume -------
+  // Movie file changed/cleared → the old trim no longer applies.
+  useEffect(() => {
+    setMovieTrim(null)
+  }, [movieFile])
+
+  // --- Resume detection: same files + same trim re-selected → offer resume --
   useEffect(() => {
     let cancelled = false
     setResumeCandidate(null)
     if (!shortFile || !movieFile) return
     ;(async () => {
       try {
-        const fp = await computeFingerprint(shortFile, movieFile)
+        const fp = await computeFingerprint(shortFile, movieFile, movieTrim)
         if (cancelled) return
         const manifest = getManifest(fp)
         if (
@@ -150,18 +159,22 @@ export default function Page() {
     return () => {
       cancelled = true
     }
-  }, [shortFile, movieFile])
+  }, [shortFile, movieFile, movieTrim])
 
   const startMerge = (resumeFrom: JobManifest | null) => {
     if (!shortFile || !movieFile) return
     const a = shortFile
     const b = movieFile
+    // Snapshot the trim NOW — the state is cleared below so a parallel merge
+    // can be configured while this one runs.
+    const trim = movieTrim
     const id = nextJobId++
     const downloadName = `${a.name.replace(/\.[^.]+$/, "")}_merged.mp4`
 
     // Clear the pickers immediately so another merge can start in parallel.
     setShortFile(null)
     setMovieFile(null)
+    setMovieTrim(null)
     setResumeCandidate(null)
 
     setJobs((prev) => [
@@ -190,7 +203,7 @@ export default function Page() {
     ;(async () => {
       let fingerprint = ""
       try {
-        fingerprint = resumeFrom?.fingerprint ?? (await computeFingerprint(a, b))
+        fingerprint = resumeFrom?.fingerprint ?? (await computeFingerprint(a, b, trim))
         updateJob(id, { fingerprint })
 
         const manifest: JobManifest = resumeFrom ?? {
@@ -257,6 +270,7 @@ export default function Page() {
                 fetchPart: (index) => fetchPartBlob(partPathname(fingerprint, index)),
               }
             : undefined,
+          trim,
         )
 
         // Merge done — video is download-ready NOW. Any still-running part
@@ -353,6 +367,8 @@ export default function Page() {
             onShortFile={setShortFile}
             onMovieFile={setMovieFile}
           />
+
+          {movieFile && <MovieTrimmer movieFile={movieFile} trim={movieTrim} onTrimChange={setMovieTrim} />}
 
           {!sizeOk && (
             <p className="mt-4 rounded-lg border border-amber-600/40 bg-amber-500/10 p-3 text-sm text-amber-300">

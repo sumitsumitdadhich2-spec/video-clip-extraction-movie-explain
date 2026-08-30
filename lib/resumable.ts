@@ -27,10 +27,16 @@ export interface JobManifest {
 }
 
 /**
- * Deterministic job ID: same two files + same merge settings = same
- * fingerprint, which is how an interrupted job is recognized later.
+ * Deterministic job ID: same two files + same merge settings (including the
+ * movie trim range, if any) = same fingerprint, which is how an interrupted
+ * job is recognized later. No trim keeps the legacy key EXACTLY the same, so
+ * existing history/resume data stays valid.
  */
-export async function computeFingerprint(fileA: File, fileB: File): Promise<string> {
+export async function computeFingerprint(
+  fileA: File,
+  fileB: File,
+  movieTrim?: { startSec: number; endSec: number } | null,
+): Promise<string> {
   const key = [
     fileA.name,
     fileA.size,
@@ -39,6 +45,7 @@ export async function computeFingerprint(fileA: File, fileB: File): Promise<stri
     fileB.size,
     fileB.lastModified,
     MERGE_SETTINGS_VERSION,
+    ...(movieTrim ? [`trim:${movieTrim.startSec.toFixed(3)}-${movieTrim.endSec.toFixed(3)}`] : []),
   ].join("\n")
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key))
   return Array.from(new Uint8Array(digest))
