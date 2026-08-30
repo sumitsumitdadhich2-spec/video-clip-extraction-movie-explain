@@ -11,7 +11,11 @@ import { upload } from "@vercel/blob/client"
 // is still processing, so saving adds no extra time after the merge.
 // ---------------------------------------------------------------------------
 
-export const MERGE_SETTINGS_VERSION = "concat-copy-v1"
+// v2: bumped after fixing the old per-part seek+cut bug that duplicated
+// 10-40s of content at keyframe boundaries (inflated durations + audio
+// drift). Bumping the version changes every fingerprint, so jobs/parts
+// produced by the old buggy pipeline can NEVER be mixed into new merges.
+export const MERGE_SETTINGS_VERSION = "concat-copy-v2"
 
 export interface JobManifest {
   fingerprint: string
@@ -70,9 +74,24 @@ export function finalPathname(fingerprint: string): string {
 // localStorage manifests
 // ---------------------------------------------------------------------------
 
-const LS_KEY = "merge-job-manifests-v1"
+const LS_KEY = "merge-job-manifests-v2"
+// Manifests created by the old buggy pipeline (concat-copy-v1). Their
+// fingerprints can never match a v2 fingerprint, so they are pure garbage —
+// purge them once so a stale "resume" is never offered from corrupt state.
+const LS_KEY_LEGACY = "merge-job-manifests-v1"
+
+function purgeLegacyManifests() {
+  try {
+    if (localStorage.getItem(LS_KEY_LEGACY) !== null) {
+      localStorage.removeItem(LS_KEY_LEGACY)
+    }
+  } catch {
+    // localStorage unavailable — nothing to purge.
+  }
+}
 
 function loadAll(): Record<string, JobManifest> {
+  purgeLegacyManifests()
   try {
     const raw = localStorage.getItem(LS_KEY)
     if (!raw) return {}
