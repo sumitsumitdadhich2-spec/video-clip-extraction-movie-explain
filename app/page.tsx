@@ -32,6 +32,7 @@ import {
   fetchPartBlob,
   fetchHistory,
   consolidateJob,
+  deleteJobFromHistory,
   isBlobConnected,
   STORAGE_QUOTA_BYTES,
 } from "@/lib/history-client"
@@ -222,6 +223,14 @@ export default function Page() {
         // the local download work exactly the same, just without History.
         const cloudEnabled = await isBlobConnected()
         if (!cloudEnabled) updateJob(id, { cloudSkipped: true })
+
+        // FRESH start (not a resume): purge any stale cloud remnants at this
+        // fingerprint from a previous run — leftover extra parts or an old
+        // final.mp4 would otherwise get mixed into History for this job.
+        if (cloudEnabled && !resumeFrom) {
+          removeManifest(fingerprint)
+          await deleteJobFromHistory(fingerprint).catch(() => {})
+        }
 
         const manifest: JobManifest = resumeFrom ?? {
           fingerprint,
