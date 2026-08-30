@@ -17,6 +17,12 @@ interface CloudManifest {
 //  - legacy single-file videos under merged/
 //  - segment-based jobs under history/<fingerprint>/ (complete OR incomplete)
 export async function GET() {
+  // Blob not connected — return an empty history instead of an error so
+  // the app keeps working (saving is simply skipped client-side).
+  if (!process.env.BLOB_READ_WRITE_TOKEN) {
+    return NextResponse.json({ videos: [], jobs: [], totalBytes: 0, connected: false })
+  }
+
   try {
     const [legacy, jobs] = await Promise.all([list({ prefix: "merged/" }), list({ prefix: "history/" })])
 
