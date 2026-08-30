@@ -178,13 +178,6 @@ async function probeFile(engine: Engine, name: string): Promise<StreamInfo> {
 // Accurate progress tracking
 // ---------------------------------------------------------------------------
 
-export interface MergeHandlers {
-  onStatus?: (message: string) => void
-  onProgress?: (percent: number) => void
-  /** Estimated seconds remaining for the current heavy step; null = unknown. */
-  onEta?: (secondsRemaining: number | null) => void
-}
-
 /**
  * Runs one ffmpeg exec while converting its REAL output-time reports into
  * an overall percentage (baseline → baseline+span) plus a time-remaining
@@ -253,22 +246,57 @@ export function formatEta(seconds: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Merge
+// Segmented, resumable merge
 // ---------------------------------------------------------------------------
+
+/** Output is produced in ~2-minute segments so each part can upload while
+ * the next one is still being processed (zero extra save time). */
+export const SEGMENT_DURATION_SEC = 120
+
+export interface SegmentPlan {
+  totalSegments: number
+  segmentDurationSec: number
+  totalDurationSec: number | null
+}
 
 export interface MergeResult {
   url: string
-  /** The merged file itself — used to save it to cloud storage (history). */
+  /** The final merged file — download-ready the moment processing hits 100%. */
   blob: Blob
   sizeBytes: number
   usedFallback: boolean
 }
 
+export interface SegmentedMergeHandlers {
+  onStatus?: (message: string) => void
+  /** Processing-only progress, 0..100 (the caller blends in upload progress). */
+  onProcessProgress?: (percent: number) => void
+  /** Estimated seconds remaining for the current heavy step; null = unknown. */
+  onEta?: (secondsRemaining: number | null) => void
+  /** Called once the segment plan is known (and again if it falls back to 1 segment). */
+  onPlan?: (plan: SegmentPlan) => void
+  /** Called the moment a segment's bytes are ready — start its upload here.
+   * MUST NOT block: processing of the next segment continues immediately. */
+  onSegmentReady?: (index: number, data: Blob) => void
+}
+
+export interface ResumeOptions {
+  /** Segment indices already uploaded by a previous (interrupted) run. */
+  completedSegments: number[]
+  /** The interrupted job's segment count — resume only applies when the
+   * fresh plan produces the SAME count (deterministic for identical files). */
+  expectedTotalSegments: number
+  /** Downloads an already-uploaded part so it can be reused locally. */
+  fetchPart: (index: number) => Promise<Blob>
+}
+
 // Inputs are MOUNTED (read directly from disk by ffmpeg — never copied into
 // memory), which is what makes 2-3GB movies workable in the browser.
 const MOUNT_DIR = "/merge_in"
+const PARTS_DIR = "/merge_parts"
 const SHORT_FIXED = "merge_short_fixed.mp4"
 const LIST_FILE = "merge_list.txt"
+const PARTS_LIST_FILE = "merge_parts_list.txt"
 const OUTPUT = "merge_output.mp4"
 
 function extOf(file: File): string {
@@ -284,14 +312,14 @@ async function safeDelete(engine: Engine, name: string) {
   }
 }
 
-async function safeUnmount(engine: Engine) {
+async function safeUnmount(engine: Engine, dir: string) {
   try {
-    await engine.ff.unmount(MOUNT_DIR)
+    await engine.ff.unmount(dir)
   } catch {
     // not mounted — ignore
   }
   try {
-    await engine.ff.deleteDir(MOUNT_DIR)
+    await engine.ff.deleteDir(dir)
   } catch {
     // dir may not exist — ignore
   }
@@ -309,25 +337,113 @@ function isMemoryError(err: unknown): boolean {
   )
 }
 
+/** Internal marker so a per-segment failure can trigger the single-pass fallback. */
+class SegmentExecError extends Error {}
+
 /**
- * Merges shortFile (Part A, front) + movieFile (Part B, back) into one MP4.
- *
- * Primary path: concat demuxer with `-c copy` — zero re-encoding, so it is
- * as fast as a file copy and preserves 100% original quality.
- *
- * Fallback (only when codecs/resolution mismatch): ONLY the short video
- * is re-encoded to match the movie's parameters (short = tiny, takes
- * seconds). The movie is NEVER re-encoded — always stream-copied.
- *
- * PARALLEL-SAFE: every call creates its own isolated ffmpeg engine, so
- * multiple merges can run at the same time without interfering.
+ * Joins already-processed part blobs into one MP4 with the concat demuxer
+ * (pure stream copy). Parts are MOUNTED via WORKERFS — zero memory copy.
  */
-export async function mergeVideos(
+async function concatPartsWithEngine(
+  engine: Engine,
+  parts: Blob[],
+  opts: {
+    baseline: number
+    span: number
+    totalSec: number | null
+    onProgress?: (percent: number) => void
+    onEta?: (secondsRemaining: number | null) => void
+  },
+): Promise<Blob> {
+  const ff = engine.ff
+  await safeUnmount(engine, PARTS_DIR)
+  await ff.createDir(PARTS_DIR)
+  await ff.mount(
+    WORKERFS,
+    { blobs: parts.map((data, i) => ({ name: `p${i}.mp4`, data: data as File })) },
+    PARTS_DIR,
+  )
+  await ff.writeFile(
+    PARTS_LIST_FILE,
+    new TextEncoder().encode(parts.map((_, i) => `file '${PARTS_DIR}/p${i}.mp4'`).join("\n")),
+  )
+
+  try {
+    const ret = await execWithProgress(
+      engine,
+      [
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        PARTS_LIST_FILE,
+        "-c",
+        "copy",
+        "-fflags",
+        "+genpts",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-y",
+        OUTPUT,
+      ],
+      opts,
+    )
+    if (ret !== 0) {
+      console.log("[v0] parts concat failed, logs tail:", engine.logBuffer.slice(-15).join(" | "))
+      throw new Error("Failed to assemble the final video from its parts.")
+    }
+
+    const data = (await engine.ff.readFile(OUTPUT)) as Uint8Array
+    await safeDelete(engine, OUTPUT)
+    if (data.byteLength === 0) throw new Error("Final video assembly produced an empty file.")
+    return new Blob([data as BlobPart], { type: "video/mp4" })
+  } finally {
+    await safeDelete(engine, PARTS_LIST_FILE)
+    await safeUnmount(engine, PARTS_DIR)
+  }
+}
+
+/**
+ * Rebuilds one MP4 from saved history parts (used by the History panel's
+ * Download button). Creates its own isolated engine.
+ */
+export async function concatPartBlobs(parts: Blob[], onProgress?: (percent: number) => void): Promise<Blob> {
+  if (parts.length === 1) return parts[0]
+  const engine = await createEngine()
+  try {
+    return await concatPartsWithEngine(engine, parts, {
+      baseline: 0,
+      span: 100,
+      totalSec: null,
+      onProgress,
+    })
+  } finally {
+    destroyEngine(engine)
+  }
+}
+
+/**
+ * Merges shortFile (Part A, front) + movieFile (Part B, back) into one MP4,
+ * producing the output in time segments so each part can be uploaded to
+ * cloud storage WHILE the next part is still processing.
+ *
+ * Primary path: concat demuxer with `-c copy` — zero re-encoding, original
+ * quality. When codecs/resolution differ, ONLY the short video is converted
+ * to match the movie (the movie is never re-encoded).
+ *
+ * If per-segment extraction fails for an exotic container, it automatically
+ * falls back to a single full-length pass (same behavior as before), so a
+ * merge never breaks because of segmentation.
+ *
+ * PARALLEL-SAFE: every call creates its own isolated ffmpeg engine.
+ */
+export async function processMergeInSegments(
   shortFile: File,
   movieFile: File,
-  handlers: MergeHandlers = {},
+  handlers: SegmentedMergeHandlers = {},
 ): Promise<MergeResult> {
-  const { onStatus, onProgress, onEta } = handlers
+  const { onStatus, onProcessProgress: onProgress, onEta, onPlan, onSegmentReady } = handlers
 
   onStatus?.("Loading merge engine...")
   onProgress?.(1)
@@ -341,7 +457,7 @@ export async function mergeVideos(
     // Mount inputs — instant, zero copy, works for multi-GB files.
     onStatus?.("Opening files (direct disk access — no memory copy)...")
     onProgress?.(3)
-    await safeUnmount(engine)
+    await safeUnmount(engine, MOUNT_DIR)
     await ff.createDir(MOUNT_DIR)
     await ff.mount(
       WORKERFS,
@@ -362,7 +478,7 @@ export async function mergeVideos(
     onProgress?.(6)
     const movieInfo = await probeFile(engine, MOVIE_IN)
 
-    // Total output duration — the base for ACCURATE percentage reporting.
+    // Total output duration — the base for the segment plan + accurate progress.
     const totalDurationSec =
       shortInfo.durationSec !== null && movieInfo.durationSec !== null
         ? shortInfo.durationSec + movieInfo.durationSec
@@ -379,11 +495,6 @@ export async function mergeVideos(
     const aOk =
       (shortInfo.audioCodec === null && movieInfo.audioCodec === null) ||
       (shortInfo.audioCodec === movieInfo.audioCodec && shortInfo.sampleRate === movieInfo.sampleRate)
-
-    // The short-fix step (when needed) is quick; give it 8→22%. The concat
-    // (the real work, scales with movie size) gets the big 22→90% range.
-    const CONCAT_BASE = 8
-    const CONCAT_BASE_FALLBACK = 22
 
     if (vOk && !aOk) {
       // FAST PATH: video matches — copy it bit-for-bit, convert ONLY the
@@ -411,7 +522,7 @@ export async function mergeVideos(
 
       const audioRet = await execWithProgress(engine, args, {
         baseline: 8,
-        span: 14,
+        span: 6,
         totalSec: shortInfo.durationSec,
         onProgress,
         onEta,
@@ -484,7 +595,7 @@ export async function mergeVideos(
 
       const encodeRet = await execWithProgress(engine, args, {
         baseline: 8,
-        span: 14,
+        span: 6,
         totalSec: shortInfo.durationSec,
         onProgress,
         onEta,
@@ -496,72 +607,129 @@ export async function mergeVideos(
       shortName = SHORT_FIXED
     }
 
-    const concatBase = usedFallback ? CONCAT_BASE_FALLBACK : CONCAT_BASE
-    onStatus?.("Merging Part A + Part B (stream copy — no re-encoding)...")
-    onProgress?.(concatBase)
+    await ff.writeFile(LIST_FILE, new TextEncoder().encode(`file '${shortName}'\nfile '${MOVIE_IN}'`))
 
-    await ff.writeFile(
-      LIST_FILE,
-      new TextEncoder().encode(`file '${shortName}'\nfile '${MOVIE_IN}'`),
-    )
+    // --- Segment plan ------------------------------------------------------
+    // Only worth segmenting when the output is meaningfully longer than one
+    // segment; unknown duration also means a single full pass.
+    let plan: SegmentPlan = {
+      totalSegments:
+        totalDurationSec !== null && totalDurationSec > SEGMENT_DURATION_SEC * 1.5
+          ? Math.ceil(totalDurationSec / SEGMENT_DURATION_SEC)
+          : 1,
+      segmentDurationSec: SEGMENT_DURATION_SEC,
+      totalDurationSec,
+    }
+    onPlan?.(plan)
 
-    // Real progress: ffmpeg reports the output timestamp as it writes; we
-    // compare against the known total duration for a true percentage + ETA.
-    const concatRet = await execWithProgress(
-      engine,
-      [
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        LIST_FILE,
-        "-c",
-        "copy",
-        "-fflags",
-        "+genpts",
-        "-avoid_negative_ts",
-        "make_zero",
-        "-y",
-        OUTPUT,
-      ],
-      {
-        baseline: concatBase,
-        span: 90 - concatBase,
+    // Segments get the big 15→88% range (they ARE the merge). Final local
+    // assembly (fast stream copy of already-processed parts) gets 88→99%.
+    const SEG_BASE = 15
+    const SEG_SPAN = 73
+
+    const runSegment = async (idx: number): Promise<Blob> => {
+      const isLast = idx === plan.totalSegments - 1
+      const partName = `merge_part_${idx}.mp4`
+      const args: string[] = []
+      if (plan.totalSegments > 1) {
+        // Input-side seek into the virtual concatenated timeline (fast).
+        args.push("-ss", (idx * plan.segmentDurationSec).toFixed(3))
+      }
+      args.push("-f", "concat", "-safe", "0", "-i", LIST_FILE)
+      if (plan.totalSegments > 1 && !isLast) {
+        args.push("-t", String(plan.segmentDurationSec))
+      }
+      args.push("-c", "copy", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero", "-y", partName)
+
+      const segTotalSec =
+        plan.totalSegments === 1
+          ? totalDurationSec
+          : isLast && totalDurationSec !== null
+            ? Math.max(1, totalDurationSec - idx * plan.segmentDurationSec)
+            : plan.segmentDurationSec
+
+      const ret = await execWithProgress(engine, args, {
+        baseline: SEG_BASE + (idx / plan.totalSegments) * SEG_SPAN,
+        span: SEG_SPAN / plan.totalSegments,
+        totalSec: segTotalSec,
+        onProgress,
+        onEta,
+      })
+      if (ret !== 0) {
+        console.log(`[v0] segment ${idx} exec failed, logs tail:`, engine.logBuffer.slice(-10).join(" | "))
+        throw new SegmentExecError(`Segment ${idx} failed`)
+      }
+
+      const data = (await ff.readFile(partName)) as Uint8Array
+      await safeDelete(engine, partName)
+      if (data.byteLength === 0) throw new SegmentExecError(`Segment ${idx} produced an empty file`)
+      return new Blob([data as BlobPart], { type: "video/mp4" })
+    }
+
+    // --- Process segments (uploads run in the caller, in parallel) ---------
+    const parts: Blob[] = []
+    try {
+      for (let idx = 0; idx < plan.totalSegments; idx++) {
+        if (plan.totalSegments > 1) {
+          onStatus?.(`Merging + saving — part ${idx + 1} of ${plan.totalSegments} (stream copy)...`)
+        } else {
+          onStatus?.("Merging Part A + Part B (stream copy — no re-encoding)...")
+        }
+        const blob = await runSegment(idx)
+        parts.push(blob)
+        onSegmentReady?.(idx, blob)
+      }
+    } catch (err) {
+      if (!(err instanceof SegmentExecError) || plan.totalSegments <= 1) {
+        throw err instanceof SegmentExecError
+          ? new Error("Merging failed while joining the two videos. The files may be in an unsupported format.")
+          : err
+      }
+      // Per-segment extraction failed for this container — fall back to one
+      // full-length pass so the merge itself never breaks.
+      console.log("[v0] segment extraction failed — falling back to single-pass merge")
+      plan = { totalSegments: 1, segmentDurationSec: SEGMENT_DURATION_SEC, totalDurationSec }
+      onPlan?.(plan)
+      parts.length = 0
+      onStatus?.("Merging Part A + Part B (stream copy — no re-encoding)...")
+      let blob: Blob
+      try {
+        blob = await runSegment(0)
+      } catch {
+        throw new Error("Merging failed while joining the two videos. The files may be in an unsupported format.")
+      }
+      parts.push(blob)
+      onSegmentReady?.(0, blob)
+    }
+
+    // Release inputs BEFORE assembling the final file to minimize peak memory.
+    await safeDelete(engine, SHORT_FIXED)
+    await safeDelete(engine, LIST_FILE)
+    await safeUnmount(engine, MOUNT_DIR)
+
+    // --- Local final assembly (fast stream copy of local parts) ------------
+    let finalBlob: Blob
+    if (parts.length === 1) {
+      finalBlob = parts[0]
+      onProgress?.(99)
+    } else {
+      onStatus?.("Finalizing video (joining parts — stream copy)...")
+      onProgress?.(88)
+      finalBlob = await concatPartsWithEngine(engine, parts, {
+        baseline: 88,
+        span: 11,
         totalSec: totalDurationSec,
         onProgress,
         onEta,
-      },
-    )
-    if (concatRet !== 0) {
-      console.log("[v0] concat failed, logs tail:", engine.logBuffer.slice(-15).join(" | "))
-      throw new Error("Merging failed while joining the two videos. The files may be in an unsupported format.")
+      })
     }
 
-    // Release inputs BEFORE reading the output to minimize peak memory.
-    await safeDelete(engine, SHORT_FIXED)
-    await safeDelete(engine, LIST_FILE)
-    await safeUnmount(engine)
-
-    onStatus?.("Preparing download...")
-    onProgress?.(92)
-    const data = (await ff.readFile(OUTPUT)) as Uint8Array
-    // Free the in-engine copy immediately — the bytes now live in `data`.
-    await safeDelete(engine, OUTPUT)
-
-    if (data.byteLength === 0) {
-      throw new Error("Merge produced an empty file. The inputs may be in an unsupported format.")
-    }
-
-    onProgress?.(96)
-    const blob = new Blob([data as BlobPart], { type: "video/mp4" })
-    const url = URL.createObjectURL(blob)
-
+    const url = URL.createObjectURL(finalBlob)
     onProgress?.(100)
     onEta?.(null)
     onStatus?.("Done!")
 
-    return { url, blob, sizeBytes: data.byteLength, usedFallback }
+    return { url, blob: finalBlob, sizeBytes: finalBlob.size, usedFallback }
   } catch (err) {
     if (isMemoryError(err)) {
       throw new Error(
