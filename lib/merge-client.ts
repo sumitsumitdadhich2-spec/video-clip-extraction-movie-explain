@@ -283,6 +283,10 @@ export interface MergeResult {
 }
 
 export interface SegmentedMergeHandlers {
+  /** When false, the output is produced in ONE direct pass (no parts).
+   * Use this when cloud saving is disabled — segmentation only exists so
+   * parts can upload while processing, so without uploads it's pure waste. */
+  segmented?: boolean
   onStatus?: (message: string) => void
   /** Processing-only progress, 0..100 (the caller blends in upload progress). */
   onProcessProgress?: (percent: number) => void
@@ -460,7 +464,7 @@ export async function processMergeInSegments(
   resume?: ResumeOptions,
   movieTrim?: MovieTrim | null,
 ): Promise<MergeResult> {
-  const { onStatus, onProcessProgress: onProgress, onEta, onPlan, onSegmentReady } = handlers
+  const { segmented, onStatus, onProcessProgress: onProgress, onEta, onPlan, onSegmentReady } = handlers
 
   onStatus?.("Loading merge engine...")
   onProgress?.(1)
@@ -649,11 +653,14 @@ export async function processMergeInSegments(
     await ff.writeFile(LIST_FILE, new TextEncoder().encode(`file '${shortName}'\n${movieEntry}`))
 
     // --- Segment plan ------------------------------------------------------
-    // Only worth segmenting when the output is meaningfully longer than one
-    // segment; unknown duration also means a single full pass.
+    // Segmentation ONLY exists so parts can upload to the cloud while the
+    // next part processes. When cloud saving is off (`segmented: false`),
+    // always do ONE direct stream-copy pass — much faster, no parts.
+    // Otherwise, only worth segmenting when the output is meaningfully
+    // longer than one segment; unknown duration also means a single pass.
     let plan: SegmentPlan = {
       totalSegments:
-        totalDurationSec !== null && totalDurationSec > SEGMENT_DURATION_SEC * 1.5
+        segmented !== false && totalDurationSec !== null && totalDurationSec > SEGMENT_DURATION_SEC * 1.5
           ? Math.ceil(totalDurationSec / SEGMENT_DURATION_SEC)
           : 1,
       segmentDurationSec: SEGMENT_DURATION_SEC,

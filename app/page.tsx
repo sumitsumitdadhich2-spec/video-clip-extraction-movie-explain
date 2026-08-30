@@ -241,6 +241,9 @@ export default function Page() {
           a,
           b,
           {
+            // No cloud saving → no reason to cut the output into parts.
+            // One direct stream-copy pass = much faster, no "part X of Y".
+            segmented: cloudEnabled,
             onStatus: (status) => updateJob(id, { status }),
             onProcessProgress: (percent) => setCombined(id, percent, null),
             onEta: (eta) => updateJob(id, { eta }),
