@@ -12,8 +12,14 @@ export interface HistoryJob {
   fingerprint: string
   name: string
   totalSegments: number | null
+  segmentDurationSec: number | null
+  totalDurationSec: number | null
   savedParts: number
+  /** Segment indices already uploaded — enables resume from any device/session. */
+  completedSegments: number[]
   partPathnames: string[]
+  /** Set once the job has been consolidated into a single final.mp4. */
+  finalPathname: string | null
   sizeBytes: number
   complete: boolean
   uploadedAt: string
@@ -57,6 +63,22 @@ export async function deleteJobFromHistory(fingerprint: string): Promise<void> {
 /** URL that streams a saved video/part for inline playback. */
 export function historyFileUrl(pathname: string, download = false): string {
   return `/api/history/file?pathname=${encodeURIComponent(pathname)}${download ? "&download=1" : ""}`
+}
+
+/**
+ * Asks the server to consolidate a fully-saved job: promotes/keeps
+ * history/<fp>/final.mp4 and deletes the redundant parts + manifest.
+ * Best-effort — on failure the parts simply remain (nothing is lost).
+ */
+export async function consolidateJob(fingerprint: string): Promise<boolean> {
+  const res = await fetch("/api/history/consolidate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ fingerprint }),
+  })
+  if (!res.ok) throw new Error("Consolidate failed")
+  const data = (await res.json()) as { consolidated?: boolean }
+  return data.consolidated === true
 }
 
 /** Downloads one saved part of a segment job as a Blob (used for resume + reassembly). */

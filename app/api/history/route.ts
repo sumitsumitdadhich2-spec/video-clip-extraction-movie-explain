@@ -7,6 +7,8 @@ interface CloudManifest {
   fingerprint?: string
   name?: string
   totalSegments?: number | null
+  segmentDurationSec?: number
+  totalDurationSec?: number | null
   completedSegments?: number[]
   createdAt?: string
 }
@@ -61,16 +63,33 @@ export async function GET() {
           // missing/corrupt manifest — fall back to part info only
         }
 
+        const finalBlob = blobs.find((b) => b.pathname === `history/${fingerprint}/final.mp4`)
         const totalSegments = manifest?.totalSegments ?? null
         const savedParts = partBlobs.length
-        const complete = totalSegments !== null && savedParts >= totalSegments && savedParts > 0
+        const complete =
+          !!finalBlob || (totalSegments !== null && savedParts >= totalSegments && savedParts > 0)
+
+        // Completed segment indices, derived from the deterministic part
+        // filenames — the client uses these to resume an interrupted job
+        // even when its localStorage manifest is gone.
+        const completedSegments = partBlobs
+          .map((b) => {
+            const m = b.pathname.match(/part-(\d{3})\.mp4$/)
+            return m ? Number.parseInt(m[1], 10) : -1
+          })
+          .filter((n) => n >= 0)
+          .sort((x, y) => x - y)
 
         return {
           fingerprint,
           name: manifest?.name || `merge-${fingerprint.slice(0, 8)}.mp4`,
           totalSegments,
+          segmentDurationSec: manifest?.segmentDurationSec ?? null,
+          totalDurationSec: manifest?.totalDurationSec ?? null,
           savedParts,
+          completedSegments,
           partPathnames: partBlobs.map((b) => b.pathname),
+          finalPathname: finalBlob ? finalBlob.pathname : null,
           sizeBytes,
           complete,
           uploadedAt: new Date(newest || Date.now()).toISOString(),

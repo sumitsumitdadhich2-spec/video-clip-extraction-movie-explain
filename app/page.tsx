@@ -22,9 +22,11 @@ import {
   uploadWithRetry,
   uploadJobManifest,
   partPathname,
+  finalPathname,
   type JobManifest,
 } from "@/lib/resumable"
-import { fetchPartBlob } from "@/lib/history-client"
+import { fetchPartBlob, fetchHistory, consolidateJob, STORAGE_QUOTA_BYTES } from "@/lib/history-client"
+import { useHistory } from "@/components/history-panel"
 
 type JobPhase = "merging" | "done" | "error"
 
@@ -67,9 +69,15 @@ export default function Page() {
   const [resumeCandidate, setResumeCandidate] = useState<JobManifest | null>(null)
   const { mutate } = useSWRConfig()
   const uploadStates = useRef<Map<number, JobUploadState>>(new Map())
+  const { data: historyData } = useHistory()
 
   const sizeOk = totalSizeOk(shortFile, movieFile)
   const canMerge = !!shortFile && !!movieFile && sizeOk
+
+  // Storage warning is informational only — merging and downloading keep
+  // working even when the 10GB cloud quota is exhausted.
+  const storageUsed = historyData?.totalBytes ?? 0
+  const storageNearlyFull = storageUsed >= STORAGE_QUOTA_BYTES * 0.9
 
   const updateJob = (id: number, patch: Partial<MergeJob> | ((j: MergeJob) => Partial<MergeJob>)) => {
     setJobs((prev) => prev.map((j) => (j.id === id ? { ...j, ...(typeof patch === "function" ? patch(j) : patch) } : j)))
@@ -108,6 +116,32 @@ export default function Page() {
           manifest.completedSegments.length < manifest.totalSegments
         ) {
           setResumeCandidate(manifest)
+          return
+        }
+
+        // No local manifest (cleared storage / different browser) — fall back
+        // to the cloud: incomplete jobs live under history/<fp>/ in Blob.
+        const history = await fetchHistory().catch(() => null)
+        if (cancelled || !history) return
+        const cloudJob = history.jobs.find((j) => j.fingerprint === fp && !j.complete)
+        if (
+          cloudJob &&
+          cloudJob.totalSegments !== null &&
+          cloudJob.completedSegments.length > 0 &&
+          cloudJob.completedSegments.length < cloudJob.totalSegments
+        ) {
+          const rebuilt: JobManifest = {
+            fingerprint: fp,
+            name: cloudJob.name,
+            inputs: { aName: shortFile.name, aSize: shortFile.size, bName: movieFile.name, bSize: movieFile.size },
+            totalSegments: cloudJob.totalSegments,
+            segmentDurationSec: cloudJob.segmentDurationSec ?? SEGMENT_DURATION_SEC,
+            totalDurationSec: cloudJob.totalDurationSec,
+            completedSegments: cloudJob.completedSegments,
+            createdAt: cloudJob.uploadedAt,
+          }
+          saveManifest(rebuilt)
+          setResumeCandidate(rebuilt)
         }
       } catch (err) {
         console.error("[v0] fingerprint error:", err)
@@ -240,10 +274,26 @@ export default function Page() {
 
         if (!state.failed && state.manifest.totalSegments !== null &&
             state.manifest.completedSegments.length >= state.manifest.totalSegments) {
-          // Fully saved: push the final manifest, clear the local one.
-          await uploadJobManifest(state.manifest).catch(() => {})
+          // Fully saved: consolidate into ONE history/<fp>/final.mp4 and
+          // delete the redundant parts + manifest. All background + best
+          // effort — the user's download has been ready since 100%.
           removeManifest(fingerprint)
           updateJob(id, { savingInBackground: false, progress: 100 })
+          try {
+            if (state.manifest.totalSegments > 1) {
+              // The browser already holds the assembled final video — upload
+              // it in the background, then the server cleans up the parts.
+              await uploadWithRetry(finalPathname(fingerprint), result.blob, "video/mp4")
+            }
+            // Single-segment jobs: the server just COPIES part-000 → final.mp4
+            // (no re-upload). Multi-part: parts + manifest get deleted now.
+            await consolidateJob(fingerprint)
+          } catch (err) {
+            // Consolidation failed (e.g. storage full) — keep the parts +
+            // cloud manifest so History playback/reassembly still works.
+            console.error("[v0] consolidation failed (parts kept):", err)
+            await uploadJobManifest(state.manifest).catch(() => {})
+          }
         } else {
           // Some parts didn't make it — keep the manifest so resume works.
           updateJob(id, { savingInBackground: false, uploadsFailed: state.failed })
@@ -308,6 +358,14 @@ export default function Page() {
             <p className="mt-4 rounded-lg border border-amber-600/40 bg-amber-500/10 p-3 text-sm text-amber-300">
               Combined file size is too large for browser merging (limit ~{formatBytes(MAX_TOTAL_BYTES)}).
               Try a smaller movie file.
+            </p>
+          )}
+
+          {storageNearlyFull && (
+            <p className="mt-4 rounded-lg border border-amber-600/40 bg-amber-500/10 p-3 text-sm text-amber-300">
+              Cloud storage is {storageUsed >= STORAGE_QUOTA_BYTES ? "full" : "almost full"} (
+              {formatBytes(storageUsed)} / {formatBytes(STORAGE_QUOTA_BYTES)}). Merging and downloading keep
+              working, but cloud saves may fail — delete old videos in History to free up space.
             </p>
           )}
 

@@ -38,6 +38,7 @@ function JobRow({ job, onDelete, deleting }: { job: HistoryJob; onDelete: () => 
   const [assembling, setAssembling] = useState<"play" | "download" | null>(null)
   const [assembleProgress, setAssembleProgress] = useState(0)
   const [playUrl, setPlayUrl] = useState<string | null>(null)
+  const [streamPlaying, setStreamPlaying] = useState(false)
   const [assembleError, setAssembleError] = useState("")
 
   const runAssemble = async (mode: "play" | "download") => {
@@ -81,7 +82,24 @@ function JobRow({ job, onDelete, deleting }: { job: HistoryJob; onDelete: () => 
           </p>
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2">
-          {job.complete ? (
+          {job.complete && job.finalPathname ? (
+            // Consolidated job — one final.mp4 in the cloud, streamed directly.
+            <>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setStreamPlaying((p) => !p)}
+                className="border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+              >
+                {streamPlaying ? "Hide" : "Play"}
+              </Button>
+              <a href={historyFileUrl(job.finalPathname, true)} download>
+                <Button size="sm" className="bg-emerald-600 font-medium hover:bg-emerald-500">
+                  Download
+                </Button>
+              </a>
+            </>
+          ) : job.complete ? (
             <>
               <Button
                 size="sm"
@@ -124,6 +142,15 @@ function JobRow({ job, onDelete, deleting }: { job: HistoryJob; onDelete: () => 
 
       {playUrl && (
         <video src={playUrl} controls autoPlay className="mt-3 w-full rounded-lg border border-slate-800 bg-black" />
+      )}
+
+      {streamPlaying && job.finalPathname && (
+        <video
+          src={historyFileUrl(job.finalPathname)}
+          controls
+          autoPlay
+          className="mt-3 w-full rounded-lg border border-slate-800 bg-black"
+        />
       )}
     </li>
   )

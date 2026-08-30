@@ -19,7 +19,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       body,
       request,
       onBeforeGenerateToken: async (pathname) => {
-        const isJobPath = /^history\/[a-f0-9]{6,64}\/(part-\d{3}\.mp4|manifest\.json)$/.test(pathname)
+        const isJobPath = /^history\/[a-f0-9]{6,64}\/(part-\d{3}\.mp4|final\.mp4|manifest\.json)$/.test(pathname)
         const isLegacyPath = pathname.startsWith("merged/")
         if (!isJobPath && !isLegacyPath) {
           throw new Error("Uploads are only allowed into the merged/ or history/<job>/ folders.")
