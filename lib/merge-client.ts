@@ -442,6 +442,7 @@ export async function processMergeInSegments(
   shortFile: File,
   movieFile: File,
   handlers: SegmentedMergeHandlers = {},
+  resume?: ResumeOptions,
 ): Promise<MergeResult> {
   const { onStatus, onProcessProgress: onProgress, onEta, onPlan, onSegmentReady } = handlers
 
@@ -666,10 +667,30 @@ export async function processMergeInSegments(
       return new Blob([data as BlobPart], { type: "video/mp4" })
     }
 
+    // --- Resume support -----------------------------------------------------
+    // Segments already uploaded by an interrupted run are DOWNLOADED instead
+    // of re-processed. Only applies when the fresh plan produces the same
+    // segment count (deterministic for identical files + settings).
+    const resumable =
+      resume &&
+      resume.expectedTotalSegments === plan.totalSegments &&
+      plan.totalSegments > 1 &&
+      resume.completedSegments.length > 0
+    const skipSet = resumable ? new Set(resume.completedSegments) : new Set<number>()
+
     // --- Process segments (uploads run in the caller, in parallel) ---------
     const parts: Blob[] = []
     try {
       for (let idx = 0; idx < plan.totalSegments; idx++) {
+        if (skipSet.has(idx)) {
+          onStatus?.(`Resuming — part ${idx + 1} of ${plan.totalSegments} already saved, reusing it...`)
+          const blob = await resume!.fetchPart(idx)
+          if (blob.size === 0) throw new SegmentExecError(`Saved part ${idx} is empty`)
+          parts.push(blob)
+          // Already uploaded — do NOT re-fire onSegmentReady.
+          onProgress?.(Math.round(SEG_BASE + ((idx + 1) / plan.totalSegments) * SEG_SPAN))
+          continue
+        }
         if (plan.totalSegments > 1) {
           onStatus?.(`Merging + saving — part ${idx + 1} of ${plan.totalSegments} (stream copy)...`)
         } else {
