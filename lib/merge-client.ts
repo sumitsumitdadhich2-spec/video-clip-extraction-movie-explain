@@ -46,16 +46,20 @@ interface Engine {
   // Dispatches ffmpeg's real progress reports (out_time of the file being
   // written) to whichever step is currently running on THIS engine.
   activeProgress: ((timeUs: number, libProgress: number) => void) | null
+  // Live log-line tap for the step currently running on THIS engine (used to
+  // detect segment-file rollovers for status updates during the single pass).
+  activeLog: ((line: string) => void) | null
 }
 
 async function createEngine(): Promise<Engine> {
   const instance = new FFmpeg()
-  const engine: Engine = { ff: instance, isMT: false, logBuffer: [], activeProgress: null }
+  const engine: Engine = { ff: instance, isMT: false, logBuffer: [], activeProgress: null, activeLog: null }
 
   instance.on("log", ({ message }) => {
     engine.logBuffer.push(message)
     // Keep the buffer bounded — a 3GB stream copy can emit a LOT of lines.
     if (engine.logBuffer.length > 400) engine.logBuffer.splice(0, engine.logBuffer.length - 200)
+    engine.activeLog?.(message)
   })
   instance.on("progress", ({ progress, time }) => {
     engine.activeProgress?.(time, progress)
@@ -94,6 +98,7 @@ function destroyEngine(engine: Engine) {
     // already dead — ignore
   }
   engine.activeProgress = null
+  engine.activeLog = null
   engine.logBuffer = []
 }
 
@@ -673,77 +678,145 @@ export async function processMergeInSegments(
     const SEG_BASE = 15
     const SEG_SPAN = 73
 
-    const runSegment = async (idx: number): Promise<Blob> => {
-      const isLast = idx === plan.totalSegments - 1
-      const partName = `merge_part_${idx}.mp4`
-      const args: string[] = []
-      if (plan.totalSegments > 1) {
-        // Input-side seek into the virtual concatenated timeline (fast).
-        args.push("-ss", (idx * plan.segmentDurationSec).toFixed(3))
-      }
-      args.push("-f", "concat", "-safe", "0", "-i", LIST_FILE)
-      if (plan.totalSegments > 1 && !isLast) {
-        args.push("-t", String(plan.segmentDurationSec))
-      }
-      args.push("-c", "copy", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero", "-y", partName)
-
-      const segTotalSec =
-        plan.totalSegments === 1
-          ? totalDurationSec
-          : isLast && totalDurationSec !== null
-            ? Math.max(1, totalDurationSec - idx * plan.segmentDurationSec)
-            : plan.segmentDurationSec
-
-      const ret = await execWithProgress(engine, args, {
-        baseline: SEG_BASE + (idx / plan.totalSegments) * SEG_SPAN,
-        span: SEG_SPAN / plan.totalSegments,
-        totalSec: segTotalSec,
-        onProgress,
-        onEta,
-      })
+    // ONE direct full-length stream-copy pass (no parts). Used when
+    // segmentation is off (cloud saving disabled) and as the safety fallback.
+    const runSinglePass = async (): Promise<Blob> => {
+      const ret = await execWithProgress(
+        engine,
+        [
+          "-f",
+          "concat",
+          "-safe",
+          "0",
+          "-i",
+          LIST_FILE,
+          "-c",
+          "copy",
+          "-fflags",
+          "+genpts",
+          "-avoid_negative_ts",
+          "make_zero",
+          "-y",
+          OUTPUT,
+        ],
+        { baseline: SEG_BASE, span: SEG_SPAN, totalSec: totalDurationSec, onProgress, onEta },
+      )
       if (ret !== 0) {
-        console.log(`[v0] segment ${idx} exec failed, logs tail:`, engine.logBuffer.slice(-10).join(" | "))
-        throw new SegmentExecError(`Segment ${idx} failed`)
+        console.log("[v0] single-pass merge failed, logs tail:", engine.logBuffer.slice(-10).join(" | "))
+        throw new SegmentExecError("Single-pass merge failed")
       }
-
-      const data = (await ff.readFile(partName)) as Uint8Array
-      await safeDelete(engine, partName)
-      if (data.byteLength === 0) throw new SegmentExecError(`Segment ${idx} produced an empty file`)
+      const data = (await ff.readFile(OUTPUT)) as Uint8Array
+      await safeDelete(engine, OUTPUT)
+      if (data.byteLength === 0) throw new SegmentExecError("Merge produced an empty file")
       return new Blob([data as BlobPart], { type: "video/mp4" })
     }
 
-    // --- Resume support -----------------------------------------------------
-    // Segments already uploaded by an interrupted run are DOWNLOADED instead
-    // of re-processed. Only applies when the fresh plan produces the same
-    // segment count (deterministic for identical files + settings).
-    const resumable =
-      resume &&
-      resume.expectedTotalSegments === plan.totalSegments &&
-      plan.totalSegments > 1 &&
-      resume.completedSegments.length > 0
-    const skipSet = resumable ? new Set(resume.completedSegments) : new Set<number>()
+    // Segmented output: ONE stream-copy pass through ffmpeg's built-in
+    // `-f segment` muxer. Unlike the old per-part seek+cut approach (which
+    // re-opened the input for every part and duplicated 10-40s of content at
+    // every keyframe boundary — inflating a 1h35m movie to ~2h and drifting
+    // the audio out of sync), the segment muxer splits the CONTINUOUS packet
+    // stream at keyframes with ZERO overlap and ZERO duplication. It's also
+    // much faster: 1 read of the inputs instead of N.
+    const runSegmentedPass = async (): Promise<Blob[]> => {
+      const partPattern = /merge_part_(\d+)\.mp4/
+      // Live "part X of Y" status as ffmpeg rolls over to each new part file.
+      engine.activeLog = (line) => {
+        if (!line.includes("Opening") || !line.includes("for writing")) return
+        const m = line.match(partPattern)
+        if (m) {
+          const n = Number.parseInt(m[1], 10) + 1
+          onStatus?.(`Merging + saving — part ${n} of ~${plan.totalSegments} (stream copy)...`)
+        }
+      }
+      let ret: number
+      try {
+        ret = await execWithProgress(
+          engine,
+          [
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            LIST_FILE,
+            "-c",
+            "copy",
+            "-fflags",
+            "+genpts",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-f",
+            "segment",
+            "-segment_time",
+            String(plan.segmentDurationSec),
+            "-reset_timestamps",
+            "1",
+            "-y",
+            "merge_part_%d.mp4",
+          ],
+          { baseline: SEG_BASE, span: SEG_SPAN, totalSec: totalDurationSec, onProgress, onEta },
+        )
+      } finally {
+        engine.activeLog = null
+      }
+      if (ret !== 0) {
+        console.log("[v0] segment-muxer pass failed, logs tail:", engine.logBuffer.slice(-10).join(" | "))
+        throw new SegmentExecError("Segment muxer pass failed")
+      }
+
+      // Collect the parts ffmpeg actually produced (keyframe cuts mean the
+      // real count can be slightly below the duration-based estimate).
+      const nodes = await ff.listDir("/")
+      const indices = nodes
+        .map((n) => {
+          const m = n.name.match(/^merge_part_(\d+)\.mp4$/)
+          return m ? Number.parseInt(m[1], 10) : null
+        })
+        .filter((n): n is number => n !== null)
+        .sort((x, y) => x - y)
+      if (indices.length === 0) throw new SegmentExecError("Segment muxer produced no parts")
+
+      const blobs: Blob[] = []
+      for (const idx of indices) {
+        const name = `merge_part_${idx}.mp4`
+        const data = (await ff.readFile(name)) as Uint8Array
+        await safeDelete(engine, name)
+        if (data.byteLength === 0) throw new SegmentExecError(`Segment ${idx} produced an empty file`)
+        blobs.push(new Blob([data as BlobPart], { type: "video/mp4" }))
+      }
+      return blobs
+    }
+
+    // NOTE on resume: parts saved by older versions were cut with per-part
+    // seeks and contain overlapping content, so they can't be reused safely.
+    // Every merge now regenerates all parts in one clean pass and re-fires
+    // onSegmentReady for each — the caller's upload simply overwrites any
+    // previously saved (possibly corrupt) parts at the same paths.
+    if (resume && resume.completedSegments.length > 0) {
+      console.log("[v0] resume data found — regenerating and re-saving all parts (single-pass split, no reuse)")
+    }
 
     // --- Process segments (uploads run in the caller, in parallel) ---------
     const parts: Blob[] = []
     try {
-      for (let idx = 0; idx < plan.totalSegments; idx++) {
-        if (skipSet.has(idx)) {
-          onStatus?.(`Resuming — part ${idx + 1} of ${plan.totalSegments} already saved, reusing it...`)
-          const blob = await resume!.fetchPart(idx)
-          if (blob.size === 0) throw new SegmentExecError(`Saved part ${idx} is empty`)
-          parts.push(blob)
-          // Already uploaded — do NOT re-fire onSegmentReady.
-          onProgress?.(Math.round(SEG_BASE + ((idx + 1) / plan.totalSegments) * SEG_SPAN))
-          continue
+      if (plan.totalSegments > 1) {
+        onStatus?.(`Merging + saving — splitting into ~${plan.totalSegments} parts (stream copy)...`)
+        const blobs = await runSegmentedPass()
+        if (blobs.length !== plan.totalSegments) {
+          // Report the REAL count so the manifest/progress UI match reality.
+          plan = { ...plan, totalSegments: blobs.length }
+          onPlan?.(plan)
         }
-        if (plan.totalSegments > 1) {
-          onStatus?.(`Merging + saving — part ${idx + 1} of ${plan.totalSegments} (stream copy)...`)
-        } else {
-          onStatus?.("Merging Part A + Part B (stream copy — no re-encoding)...")
+        for (let idx = 0; idx < blobs.length; idx++) {
+          parts.push(blobs[idx])
+          onSegmentReady?.(idx, blobs[idx])
         }
-        const blob = await runSegment(idx)
+      } else {
+        onStatus?.("Merging Part A + Part B (stream copy — no re-encoding)...")
+        const blob = await runSinglePass()
         parts.push(blob)
-        onSegmentReady?.(idx, blob)
+        onSegmentReady?.(0, blob)
       }
     } catch (err) {
       if (!(err instanceof SegmentExecError) || plan.totalSegments <= 1) {
@@ -751,16 +824,16 @@ export async function processMergeInSegments(
           ? new Error("Merging failed while joining the two videos. The files may be in an unsupported format.")
           : err
       }
-      // Per-segment extraction failed for this container — fall back to one
+      // Segment muxer failed for this container — fall back to one
       // full-length pass so the merge itself never breaks.
-      console.log("[v0] segment extraction failed — falling back to single-pass merge")
+      console.log("[v0] segment muxer failed — falling back to single-pass merge")
       plan = { totalSegments: 1, segmentDurationSec: SEGMENT_DURATION_SEC, totalDurationSec }
       onPlan?.(plan)
       parts.length = 0
       onStatus?.("Merging Part A + Part B (stream copy — no re-encoding)...")
       let blob: Blob
       try {
-        blob = await runSegment(0)
+        blob = await runSinglePass()
       } catch {
         throw new Error("Merging failed while joining the two videos. The files may be in an unsupported format.")
       }
@@ -788,6 +861,35 @@ export async function processMergeInSegments(
         onProgress,
         onEta,
       })
+    }
+
+    // --- Output verification (guards against duration/sync regressions) ----
+    // Probe the final file's REAL duration and compare with short + movie.
+    // Best-effort: verification problems never fail a completed merge.
+    if (totalDurationSec !== null) {
+      const VERIFY_DIR = "/merge_verify"
+      try {
+        await safeUnmount(engine, VERIFY_DIR)
+        await ff.createDir(VERIFY_DIR)
+        await ff.mount(WORKERFS, { blobs: [{ name: "out.mp4", data: finalBlob as File }] }, VERIFY_DIR)
+        const outInfo = await probeFile(engine, `${VERIFY_DIR}/out.mp4`)
+        if (outInfo.durationSec !== null) {
+          const diff = Math.abs(outInfo.durationSec - totalDurationSec)
+          if (diff > 5) {
+            console.warn(
+              `[v0] MERGE DURATION MISMATCH: expected ~${formatTimecode(totalDurationSec)} but output is ${formatTimecode(outInfo.durationSec)} (off by ${Math.round(diff)}s) — possible overlap/sync bug`,
+            )
+          } else {
+            console.log(
+              `[v0] merge verified: output ${formatTimecode(outInfo.durationSec)} ≈ expected ${formatTimecode(totalDurationSec)}`,
+            )
+          }
+        }
+      } catch {
+        // verification is best-effort only
+      } finally {
+        await safeUnmount(engine, VERIFY_DIR)
+      }
     }
 
     const url = URL.createObjectURL(finalBlob)
