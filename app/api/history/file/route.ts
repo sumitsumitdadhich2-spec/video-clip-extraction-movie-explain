@@ -10,7 +10,9 @@ export async function GET(request: NextRequest) {
     const pathname = request.nextUrl.searchParams.get("pathname")
     const download = request.nextUrl.searchParams.get("download") === "1"
 
-    if (!pathname || !pathname.startsWith("merged/")) {
+    const isLegacy = !!pathname && pathname.startsWith("merged/")
+    const isJobPart = !!pathname && /^history\/[a-f0-9]{6,64}\/part-\d{3}\.mp4$/.test(pathname)
+    if (!pathname || (!isLegacy && !isJobPart)) {
       return NextResponse.json({ error: "Invalid pathname" }, { status: 400 })
     }
 

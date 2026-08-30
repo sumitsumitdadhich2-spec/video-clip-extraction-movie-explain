@@ -1,32 +1,61 @@
 "use client"
 
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { useSWRConfig } from "swr"
 import { MergeUploader } from "@/components/merge-uploader"
 import { HistoryPanel } from "@/components/history-panel"
 import { Button } from "@/components/ui/button"
-import { mergeVideos, totalSizeOk, formatBytes, formatEta, MAX_TOTAL_BYTES } from "@/lib/merge-client"
-import { saveToHistory } from "@/lib/history-client"
+import {
+  processMergeInSegments,
+  totalSizeOk,
+  formatBytes,
+  formatEta,
+  MAX_TOTAL_BYTES,
+  SEGMENT_DURATION_SEC,
+} from "@/lib/merge-client"
+import {
+  computeFingerprint,
+  getManifest,
+  saveManifest,
+  removeManifest,
+  uploadWithRetry,
+  uploadJobManifest,
+  partPathname,
+  type JobManifest,
+} from "@/lib/resumable"
+import { fetchPartBlob } from "@/lib/history-client"
 
-type JobPhase = "merging" | "saving" | "done" | "error"
+type JobPhase = "merging" | "done" | "error"
 
 interface MergeJob {
   id: number
   name: string
+  fingerprint: string
   phase: JobPhase
   status: string
+  /** Combined "Merging + Saving" percent (one bar — no separate save step). */
   progress: number
+  /** Raw processing percent from ffmpeg (0..100). */
+  processPercent: number
   eta: number | null
-  saveProgress: number
   error: string
   /** Local object URL for instant playback/download (this session only). */
   localUrl: string | null
   sizeBytes: number
   usedFallback: boolean
-  /** Set once saved to Blob — survives refresh via History. */
-  savedPathname: string | null
-  saveFailed: boolean
+  totalSegments: number | null
+  uploadedSegments: number
+  /** True while parts are still uploading after the merge itself finished. */
+  savingInBackground: boolean
+  /** True if any part exhausted its 3 upload retries (merge still completes). */
+  uploadsFailed: boolean
+}
+
+interface JobUploadState {
+  manifest: JobManifest
+  pending: Promise<void>[]
+  failed: boolean
 }
 
 let nextJobId = 1
@@ -35,34 +64,61 @@ export default function Page() {
   const [shortFile, setShortFile] = useState<File | null>(null)
   const [movieFile, setMovieFile] = useState<File | null>(null)
   const [jobs, setJobs] = useState<MergeJob[]>([])
+  const [resumeCandidate, setResumeCandidate] = useState<JobManifest | null>(null)
   const { mutate } = useSWRConfig()
-  // Keeps the merged blobs around for "retry save" without re-merging.
-  const blobCache = useRef<Map<number, Blob>>(new Map())
+  const uploadStates = useRef<Map<number, JobUploadState>>(new Map())
 
   const sizeOk = totalSizeOk(shortFile, movieFile)
   const canMerge = !!shortFile && !!movieFile && sizeOk
 
-  const updateJob = (id: number, patch: Partial<MergeJob>) => {
-    setJobs((prev) => prev.map((j) => (j.id === id ? { ...j, ...patch } : j)))
+  const updateJob = (id: number, patch: Partial<MergeJob> | ((j: MergeJob) => Partial<MergeJob>)) => {
+    setJobs((prev) => prev.map((j) => (j.id === id ? { ...j, ...(typeof patch === "function" ? patch(j) : patch) } : j)))
   }
 
-  const saveJobToHistory = async (id: number, blob: Blob, downloadName: string) => {
-    updateJob(id, { phase: "saving", saveProgress: 0, saveFailed: false })
-    try {
-      const { pathname } = await saveToHistory(blob, downloadName, (percent) => {
-        updateJob(id, { saveProgress: percent })
-      })
-      updateJob(id, { phase: "done", savedPathname: pathname, saveProgress: 100 })
-      blobCache.current.delete(id)
-      mutate("history")
-    } catch (err) {
-      console.error("[v0] history save error:", err)
-      // Merge succeeded — keep the local download working, just flag the save.
-      updateJob(id, { phase: "done", saveFailed: true })
+  // Combined progress: processing carries 75% of the bar; part uploads
+  // (which run in parallel with processing) carry 25% — ONE bar total.
+  const setCombined = (id: number, processPercent: number | null, uploadedSegments: number | null) => {
+    updateJob(id, (j) => {
+      const proc = processPercent ?? j.processPercent
+      const uploaded = uploadedSegments ?? j.uploadedSegments
+      const total = j.totalSegments
+      const uploadPct = total && total > 0 ? (uploaded / total) * 100 : 0
+      return {
+        processPercent: proc,
+        uploadedSegments: uploaded,
+        progress: Math.min(100, Math.round(proc * 0.75 + uploadPct * 0.25)),
+      }
+    })
+  }
+
+  // --- Resume detection: same two files re-selected → offer to resume -------
+  useEffect(() => {
+    let cancelled = false
+    setResumeCandidate(null)
+    if (!shortFile || !movieFile) return
+    ;(async () => {
+      try {
+        const fp = await computeFingerprint(shortFile, movieFile)
+        if (cancelled) return
+        const manifest = getManifest(fp)
+        if (
+          manifest &&
+          manifest.totalSegments !== null &&
+          manifest.completedSegments.length > 0 &&
+          manifest.completedSegments.length < manifest.totalSegments
+        ) {
+          setResumeCandidate(manifest)
+        }
+      } catch (err) {
+        console.error("[v0] fingerprint error:", err)
+      }
+    })()
+    return () => {
+      cancelled = true
     }
-  }
+  }, [shortFile, movieFile])
 
-  const handleMerge = () => {
+  const startMerge = (resumeFrom: JobManifest | null) => {
     if (!shortFile || !movieFile) return
     const a = shortFile
     const b = movieFile
@@ -72,42 +128,127 @@ export default function Page() {
     // Clear the pickers immediately so another merge can start in parallel.
     setShortFile(null)
     setMovieFile(null)
+    setResumeCandidate(null)
 
     setJobs((prev) => [
       {
         id,
         name: downloadName,
+        fingerprint: "",
         phase: "merging",
         status: "Starting...",
         progress: 0,
+        processPercent: 0,
         eta: null,
-        saveProgress: 0,
         error: "",
         localUrl: null,
         sizeBytes: 0,
         usedFallback: false,
-        savedPathname: null,
-        saveFailed: false,
+        totalSegments: resumeFrom?.totalSegments ?? null,
+        uploadedSegments: resumeFrom?.completedSegments.length ?? 0,
+        savingInBackground: false,
+        uploadsFailed: false,
       },
       ...prev,
     ])
 
     // Run in the background — each job has its own isolated ffmpeg engine.
     ;(async () => {
+      let fingerprint = ""
       try {
-        const result = await mergeVideos(a, b, {
-          onStatus: (status) => updateJob(id, { status }),
-          onProgress: (progress) => updateJob(id, { progress }),
-          onEta: (eta) => updateJob(id, { eta }),
-        })
-        blobCache.current.set(id, result.blob)
+        fingerprint = resumeFrom?.fingerprint ?? (await computeFingerprint(a, b))
+        updateJob(id, { fingerprint })
+
+        const manifest: JobManifest = resumeFrom ?? {
+          fingerprint,
+          name: downloadName,
+          inputs: { aName: a.name, aSize: a.size, bName: b.name, bSize: b.size },
+          totalSegments: null,
+          segmentDurationSec: SEGMENT_DURATION_SEC,
+          totalDurationSec: null,
+          completedSegments: [],
+          createdAt: new Date().toISOString(),
+        }
+        const state: JobUploadState = { manifest, pending: [], failed: false }
+        uploadStates.current.set(id, state)
+        saveManifest(manifest)
+
+        const result = await processMergeInSegments(
+          a,
+          b,
+          {
+            onStatus: (status) => updateJob(id, { status }),
+            onProcessProgress: (percent) => setCombined(id, percent, null),
+            onEta: (eta) => updateJob(id, { eta }),
+            onPlan: (plan) => {
+              // A plan change (e.g. fallback to a single pass) invalidates any
+              // previously uploaded parts — reset the manifest to match.
+              if (state.manifest.totalSegments !== null && state.manifest.totalSegments !== plan.totalSegments) {
+                state.manifest.completedSegments = []
+                updateJob(id, { uploadedSegments: 0 })
+              }
+              state.manifest.totalSegments = plan.totalSegments
+              state.manifest.segmentDurationSec = plan.segmentDurationSec
+              state.manifest.totalDurationSec = plan.totalDurationSec
+              saveManifest(state.manifest)
+              updateJob(id, { totalSegments: plan.totalSegments })
+            },
+            onSegmentReady: (index, data) => {
+              // Fire-and-forget: the upload runs WHILE the next segment is
+              // still processing. Never blocks or breaks the merge.
+              const p = uploadWithRetry(partPathname(fingerprint, index), data, "video/mp4")
+                .then(() => {
+                  if (!state.manifest.completedSegments.includes(index)) {
+                    state.manifest.completedSegments.push(index)
+                    state.manifest.completedSegments.sort((x, y) => x - y)
+                  }
+                  saveManifest(state.manifest)
+                  setCombined(id, null, state.manifest.completedSegments.length)
+                  // Best-effort cloud manifest so incomplete jobs are visible
+                  // in History from any session.
+                  void uploadJobManifest(state.manifest).catch(() => {})
+                })
+                .catch((err) => {
+                  console.error("[v0] part upload failed permanently:", err)
+                  state.failed = true
+                  updateJob(id, { uploadsFailed: true })
+                })
+              state.pending.push(p)
+            },
+          },
+          resumeFrom && resumeFrom.totalSegments !== null
+            ? {
+                completedSegments: resumeFrom.completedSegments,
+                expectedTotalSegments: resumeFrom.totalSegments,
+                fetchPart: (index) => fetchPartBlob(partPathname(fingerprint, index)),
+              }
+            : undefined,
+        )
+
+        // Merge done — video is download-ready NOW. Any still-running part
+        // uploads finish in the background.
         updateJob(id, {
+          phase: "done",
           localUrl: result.url,
           sizeBytes: result.sizeBytes,
           usedFallback: result.usedFallback,
+          savingInBackground: true,
+          eta: null,
         })
-        // Auto-save to cloud storage so a refresh/crash can't lose it.
-        await saveJobToHistory(id, result.blob, downloadName)
+
+        await Promise.allSettled(state.pending)
+
+        if (!state.failed && state.manifest.totalSegments !== null &&
+            state.manifest.completedSegments.length >= state.manifest.totalSegments) {
+          // Fully saved: push the final manifest, clear the local one.
+          await uploadJobManifest(state.manifest).catch(() => {})
+          removeManifest(fingerprint)
+          updateJob(id, { savingInBackground: false, progress: 100 })
+        } else {
+          // Some parts didn't make it — keep the manifest so resume works.
+          updateJob(id, { savingInBackground: false, uploadsFailed: state.failed })
+        }
+        mutate("history")
       } catch (err) {
         console.error("[v0] merge error:", err)
         updateJob(id, {
@@ -117,6 +258,9 @@ export default function Page() {
               ? err.message
               : "Merge failed. The files may be too large for the browser, or in an unsupported format.",
         })
+        mutate("history")
+      } finally {
+        uploadStates.current.delete(id)
       }
     })()
   }
@@ -127,15 +271,9 @@ export default function Page() {
       if (job?.localUrl) URL.revokeObjectURL(job.localUrl)
       return prev.filter((j) => j.id !== id)
     })
-    blobCache.current.delete(id)
   }
 
-  const retrySave = (job: MergeJob) => {
-    const blob = blobCache.current.get(job.id)
-    if (blob) void saveJobToHistory(job.id, blob, job.name)
-  }
-
-  const activeJobs = jobs.filter((j) => j.phase === "merging" || j.phase === "saving").length
+  const activeJobs = jobs.filter((j) => j.phase === "merging" || j.savingInBackground).length
 
   return (
     <main className="min-h-screen bg-slate-950 p-4 md:p-8">
@@ -145,8 +283,8 @@ export default function Page() {
             <h1 className="text-balance text-2xl font-bold text-slate-50 md:text-3xl">Fast Video Merger</h1>
             <p className="mt-2 text-pretty text-slate-400">
               Upload a short video (Part A) and a full movie (Part B). They merge into one video — short in
-              front, movie after — with no cuts, no re-encoding, and original quality. Merged videos are
-              saved to History automatically, so a refresh or crash never loses your work.
+              front, movie after — with original quality. Each part is saved to cloud History WHILE the merge
+              runs, so a refresh or crash never loses progress: re-select the same files and resume.
             </p>
           </div>
           <Link
@@ -173,12 +311,48 @@ export default function Page() {
             </p>
           )}
 
+          {resumeCandidate && (
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-blue-600/40 bg-blue-500/10 p-3">
+              <p className="text-sm text-blue-200">
+                Previous merge of these files stopped at{" "}
+                <span className="font-semibold">
+                  {resumeCandidate.completedSegments.length}/{resumeCandidate.totalSegments} parts saved
+                </span>
+                {" — resume to skip the already-saved parts."}
+              </p>
+              <div className="flex shrink-0 gap-2">
+                <Button
+                  size="sm"
+                  onClick={() => startMerge(resumeCandidate)}
+                  className="bg-blue-600 font-semibold hover:bg-blue-500"
+                >
+                  Resume
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    removeManifest(resumeCandidate.fingerprint)
+                    setResumeCandidate(null)
+                  }}
+                  className="border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+                >
+                  Start Fresh
+                </Button>
+              </div>
+            </div>
+          )}
+
           <Button
-            onClick={handleMerge}
+            onClick={() => startMerge(resumeCandidate)}
             disabled={!canMerge}
             className="mt-6 h-11 w-full bg-blue-600 text-base font-semibold hover:bg-blue-500 disabled:opacity-50"
           >
-            {activeJobs > 0 ? `Merge Videos (${activeJobs} running — parallel OK)` : "Merge Videos"}
+            {resumeCandidate
+              ? "Resume Merge"
+              : activeJobs > 0
+                ? `Merge Videos (${activeJobs} running — parallel OK)`
+                : "Merge Videos"}
           </Button>
 
           {activeJobs > 0 && (
@@ -201,7 +375,7 @@ export default function Page() {
                         {job.usedFallback
                           ? " — short converted to match movie format (movie kept original quality)"
                           : " — pure stream copy, 100% original quality"}
-                        {job.savedPathname && " · Saved to History"}
+                        {!job.savingInBackground && !job.uploadsFailed && " · Saved to History"}
                       </p>
                     )}
                   </div>
@@ -220,7 +394,9 @@ export default function Page() {
                 {job.phase === "merging" && (
                   <div className="mt-3">
                     <div className="mb-2 flex items-center justify-between gap-3 text-sm">
-                      <span className="min-w-0 flex-1 truncate text-slate-300">{job.status}</span>
+                      <span className="min-w-0 flex-1 truncate text-slate-300">
+                        Merging + Saving — {job.status}
+                      </span>
                       <span className="shrink-0 font-mono text-slate-400">
                         {job.eta !== null && job.eta > 0 && (
                           <span className="mr-3 text-slate-500">~{formatEta(job.eta)} left</span>
@@ -234,21 +410,12 @@ export default function Page() {
                         style={{ width: `${job.progress}%` }}
                       />
                     </div>
-                  </div>
-                )}
-
-                {job.phase === "saving" && (
-                  <div className="mt-3">
-                    <div className="mb-2 flex items-center justify-between gap-3 text-sm">
-                      <span className="text-slate-300">Saving to History (cloud storage)...</span>
-                      <span className="font-mono text-slate-400">{job.saveProgress}%</span>
-                    </div>
-                    <div className="h-2 overflow-hidden rounded-full bg-slate-800">
-                      <div
-                        className="h-full rounded-full bg-emerald-500 transition-all duration-300"
-                        style={{ width: `${job.saveProgress}%` }}
-                      />
-                    </div>
+                    {job.totalSegments !== null && job.totalSegments > 1 && (
+                      <p className="mt-1.5 text-xs text-slate-500">
+                        {job.uploadedSegments}/{job.totalSegments} parts saved to cloud (uploads run alongside
+                        the merge)
+                      </p>
+                    )}
                   </div>
                 )}
 
@@ -260,22 +427,20 @@ export default function Page() {
 
                 {job.phase === "done" && (
                   <div className="mt-3 flex flex-col gap-3">
-                    {job.saveFailed && (
-                      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-600/40 bg-amber-500/10 p-3">
-                        <p className="text-sm text-amber-300">
-                          Merge succeeded but saving to History failed (storage may be full). Download below
-                          before leaving the page.
-                        </p>
-                        {blobCache.current.has(job.id) && (
-                          <Button
-                            size="sm"
-                            onClick={() => retrySave(job)}
-                            className="bg-amber-600 font-medium hover:bg-amber-500"
-                          >
-                            Retry Save
-                          </Button>
-                        )}
-                      </div>
+                    {job.savingInBackground && (
+                      <p className="rounded-lg border border-blue-600/40 bg-blue-500/10 p-3 text-sm text-blue-200">
+                        Finishing cloud save in the background ({job.uploadedSegments}
+                        {job.totalSegments !== null ? `/${job.totalSegments}` : ""} parts saved) — your download
+                        below is already ready.
+                      </p>
+                    )}
+
+                    {job.uploadsFailed && !job.savingInBackground && (
+                      <p className="rounded-lg border border-amber-600/40 bg-amber-500/10 p-3 text-sm text-amber-300">
+                        Merge succeeded but some parts could not be saved to History (storage may be full).
+                        Download below before leaving the page — or re-select the same files later to retry
+                        saving via Resume.
+                      </p>
                     )}
 
                     {job.localUrl && (
@@ -302,8 +467,8 @@ export default function Page() {
         <HistoryPanel />
 
         <p className="mt-4 text-center text-xs text-slate-500">
-          Merging happens on your device; the finished video is then saved to your 10GB cloud History so it
-          survives refresh and crashes. Use Delete in History to free up storage.
+          Merging happens on your device; each finished part uploads to your 10GB cloud History while the next
+          part is still processing — merge 100% means saved. Use Delete in History to free up storage.
         </p>
       </div>
     </main>
