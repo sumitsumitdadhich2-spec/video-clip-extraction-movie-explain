@@ -55,6 +55,10 @@ export function manifestPathname(fingerprint: string): string {
   return `history/${fingerprint}/manifest.json`
 }
 
+export function finalPathname(fingerprint: string): string {
+  return `history/${fingerprint}/final.mp4`
+}
+
 // ---------------------------------------------------------------------------
 // localStorage manifests
 // ---------------------------------------------------------------------------
