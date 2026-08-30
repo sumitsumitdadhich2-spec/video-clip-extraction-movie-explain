@@ -12,6 +12,13 @@ import { NextResponse } from "next/server"
 //     interrupted job can be found and resumed later, and re-uploads of the
 //     same part after a retry/resume simply overwrite.
 export async function POST(request: Request): Promise<NextResponse> {
+  // Blob not connected — respond clearly so any (unexpected) upload attempt
+  // fails fast instead of hanging. The client normally skips saving entirely
+  // after checking /api/history/status.
+  if (!process.env.BLOB_READ_WRITE_TOKEN) {
+    return NextResponse.json({ error: "Blob storage is not connected — cloud saving is skipped." }, { status: 503 })
+  }
+
   const body = (await request.json()) as HandleUploadBody
 
   try {

@@ -24,6 +24,7 @@ import {
   removeManifest,
   uploadWithRetry,
   uploadJobManifest,
+  isBlobConnected,
   partPathname,
   finalPathname,
   type JobManifest,
@@ -55,6 +56,8 @@ interface MergeJob {
   savingInBackground: boolean
   /** True if any part exhausted its 3 upload retries (merge still completes). */
   uploadsFailed: boolean
+  /** True when Blob storage is not connected — cloud saving is skipped entirely. */
+  cloudSaveSkipped: boolean
 }
 
 interface JobUploadState {
@@ -98,7 +101,10 @@ export default function Page() {
       return {
         processPercent: proc,
         uploadedSegments: uploaded,
-        progress: Math.min(100, Math.round(proc * 0.75 + uploadPct * 0.25)),
+        // No cloud saving → processing IS the whole bar.
+        progress: j.cloudSaveSkipped
+          ? Math.min(100, Math.round(proc))
+          : Math.min(100, Math.round(proc * 0.75 + uploadPct * 0.25)),
       }
     })
   }
@@ -195,6 +201,7 @@ export default function Page() {
         uploadedSegments: resumeFrom?.completedSegments.length ?? 0,
         savingInBackground: false,
         uploadsFailed: false,
+        cloudSaveSkipped: false,
       },
       ...prev,
     ])
@@ -205,6 +212,14 @@ export default function Page() {
       try {
         fingerprint = resumeFrom?.fingerprint ?? (await computeFingerprint(a, b, trim))
         updateJob(id, { fingerprint })
+
+        // Blob not connected → skip ALL cloud saving silently. The merge and
+        // download work exactly the same, just without History uploads.
+        const blobConnected = await isBlobConnected()
+        if (!blobConnected) {
+          console.log("[v0] Blob storage not connected — skipping cloud save for this merge")
+          updateJob(id, { cloudSaveSkipped: true })
+        }
 
         const manifest: JobManifest = resumeFrom ?? {
           fingerprint,
@@ -241,6 +256,8 @@ export default function Page() {
               updateJob(id, { totalSegments: plan.totalSegments })
             },
             onSegmentReady: (index, data) => {
+              // Blob not connected — nothing to save, skip silently.
+              if (!blobConnected) return
               // Fire-and-forget: the upload runs WHILE the next segment is
               // still processing. Never blocks or breaks the merge.
               const p = uploadWithRetry(partPathname(fingerprint, index), data, "video/mp4")
@@ -280,9 +297,16 @@ export default function Page() {
           localUrl: result.url,
           sizeBytes: result.sizeBytes,
           usedFallback: result.usedFallback,
-          savingInBackground: true,
+          savingInBackground: blobConnected,
           eta: null,
         })
+
+        if (!blobConnected) {
+          // Saving skipped — download-only mode. Nothing else to do.
+          updateJob(id, { progress: 100 })
+          removeManifest(fingerprint)
+          return
+        }
 
         await Promise.allSettled(state.pending)
 

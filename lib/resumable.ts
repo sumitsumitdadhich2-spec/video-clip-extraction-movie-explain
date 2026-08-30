@@ -13,6 +13,32 @@ import { upload } from "@vercel/blob/client"
 
 export const MERGE_SETTINGS_VERSION = "concat-copy-v1"
 
+// ---------------------------------------------------------------------------
+// Blob availability — cloud saving is OPTIONAL
+// ---------------------------------------------------------------------------
+
+let blobConnectedCache: boolean | null = null
+
+/**
+ * Checks ONCE per session whether Blob storage is connected on the server.
+ * When it isn't, all cloud saving is silently skipped — merging and
+ * downloading keep working without any upload errors.
+ */
+export async function isBlobConnected(): Promise<boolean> {
+  if (blobConnectedCache !== null) return blobConnectedCache
+  try {
+    const res = await fetch("/api/history/status")
+    if (!res.ok) throw new Error("status check failed")
+    const data = (await res.json()) as { connected?: boolean }
+    blobConnectedCache = data.connected === true
+  } catch {
+    // Can't verify — assume connected so saving is still attempted (uploads
+    // have their own retry + graceful failure handling).
+    blobConnectedCache = true
+  }
+  return blobConnectedCache
+}
+
 export interface JobManifest {
   fingerprint: string
   /** Output filename shown in History. */
