@@ -6,6 +6,11 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
+  // The cloned voice library lives in the repo, so the audio files must be
+  // bundled with the API routes that read them on a deployment.
+  outputFileTracingIncludes: {
+    "/api/voices/**": ["./data/voices/**/*"],
+  },
   async headers() {
     return [
       {

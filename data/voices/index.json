@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "test-narrator",
+      "name": "Test Narrator",
+      "language": "hi",
+      "notes": "",
+      "primarySampleId": null,
+      "samples": [],
+      "takes": [],
+      "createdAt": "2026-09-01T20:11:50.979Z",
+      "updatedAt": "2026-09-01T20:11:50.979Z"
+    }
+  ]
+}

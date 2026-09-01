@@ -1,6 +1,7 @@
 "use client"
 
 import { useState } from "react"
+import Link from "next/link"
 import { VideoUploader } from "@/components/video-uploader"
 import { ComparisonViewer } from "@/components/comparison-viewer"
 import { ExtractionPanel } from "@/components/extraction-panel"
@@ -58,6 +59,20 @@ export default function Page() {
             report) — cuts are made from the movie, merged, and previewed. Add the short video too and
             you also get side-by-side pair comparison. All in your browser.
           </p>
+          <div className="mt-4 flex flex-wrap gap-2">
+            <Link
+              href="/"
+              className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-slate-800"
+            >
+              ← Merger (Page 1)
+            </Link>
+            <Link
+              href="/voice-clone"
+              className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-slate-800"
+            >
+              Voice Clone (Page 3) →
+            </Link>
+          </div>
         </header>
 
         <nav className="mb-8 grid grid-cols-3 gap-3">
