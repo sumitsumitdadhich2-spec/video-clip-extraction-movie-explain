@@ -388,12 +388,20 @@ export default function Page() {
               runs, so a refresh or crash never loses progress: re-select the same files and resume.
             </p>
           </div>
-          <Link
-            href="/matcher"
-            className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-slate-800"
-          >
-            Clip Matcher (Page 2) →
-          </Link>
+          <div className="flex flex-wrap gap-2">
+            <Link
+              href="/matcher"
+              className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-slate-800"
+            >
+              Clip Matcher (Page 2) →
+            </Link>
+            <Link
+              href="/voice-clone"
+              className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-slate-800"
+            >
+              Voice Clone (Page 3) →
+            </Link>
+          </div>
         </header>
 
         <div className="rounded-xl border border-slate-800 bg-slate-900 p-4 md:p-6">
