@@ -73,6 +73,10 @@ async function extractOneClip(ff: FFmpeg, pair: MappingPair): Promise<ExtractedC
     "libx264",
     "-preset",
     "ultrafast",
+    // Resample audio against timestamps so voice stays in sync at every cut
+    // boundary (prevents drift when clips are concatenated).
+    "-af",
+    "aresample=async=1:first_pts=0",
     "-c:a",
     "aac",
     "-ar",

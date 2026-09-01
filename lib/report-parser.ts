@@ -29,6 +29,8 @@ export interface Verdict {
 export interface ParsedReport {
   pairs: MappingPair[]
   verdict: Verdict
+  /** "hissa" = full analysis report, "simple" = plain timestamp-range list */
+  format: "hissa" | "simple"
 }
 
 // Converts "MM:SS.mmm" or "HH:MM:SS.mmm" to seconds.
@@ -46,6 +48,95 @@ export function timestampToSeconds(ts: string): number {
     return hours * 3600 + minutes * 60 + seconds
   }
   return parseFloat(parts[0]) || 0
+}
+
+// ---------------------------------------------------------------------------
+// Flexible timestamp parsing for the plain timestamp-range format.
+//
+// Accepts, per timestamp:
+//   HH:MM:SS:FFF   (e.g. 1:10:24:208)
+//   MM:SS:FFF      (e.g. 10:24:208)  — hours omitted
+//   HH:MM:SS.FFF / MM:SS.FFF          — dot-millisecond variants
+//   HH:MM:SS / MM:SS / SS             — no milliseconds
+//
+// Rule for colon-milliseconds: when there is no dot and the LAST segment has
+// exactly 3 digits (and there are 3+ segments), it is treated as milliseconds.
+// ---------------------------------------------------------------------------
+export function flexibleTimestampToSeconds(raw: string): number | null {
+  const t = raw.trim()
+  if (!t) return null
+
+  let main = t
+  let msPart: string | null = null
+
+  // Dot-millisecond form: strip ".FFF" off the end first.
+  const dotIdx = t.lastIndexOf(".")
+  if (dotIdx !== -1) {
+    msPart = t.slice(dotIdx + 1)
+    main = t.slice(0, dotIdx)
+    if (!/^\d{1,3}$/.test(msPart)) return null
+  }
+
+  let parts = main.split(":").map((p) => p.trim())
+  if (parts.length === 0 || parts.some((p) => p === "" || !/^\d+$/.test(p))) return null
+
+  // Colon-millisecond form: mm:ss:fff or hh:mm:ss:fff (last segment = 3 digits).
+  if (msPart === null && parts.length >= 3 && parts[parts.length - 1].length === 3) {
+    msPart = parts[parts.length - 1]
+    parts = parts.slice(0, -1)
+  }
+  if (parts.length > 3) return null
+
+  const nums = parts.map((p) => Number.parseInt(p, 10))
+  let seconds = 0
+  if (parts.length === 3) seconds = nums[0] * 3600 + nums[1] * 60 + nums[2]
+  else if (parts.length === 2) seconds = nums[0] * 60 + nums[1]
+  else seconds = nums[0]
+
+  if (msPart !== null) seconds += Number.parseInt(msPart.padEnd(3, "0"), 10) / 1000
+  return seconds
+}
+
+// One range per line: "10:24:208 - 10:25:424" (also –, —, or "to" separators).
+const SIMPLE_RANGE = /^([\d:.]+)\s*(?:-|–|—|to)\s*([\d:.]+)$/i
+
+// Parses a plain list of movie timestamp ranges (one per line) into pairs.
+// Short-side times are laid out sequentially (cut 1 starts at 0:00 of the
+// short, cut 2 right after it, ...) so side-by-side compare still works when
+// a short video is also uploaded.
+export function parseSimpleRanges(text: string): MappingPair[] {
+  const pairs: MappingPair[] = []
+  let shortCursor = 0
+
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line) continue
+    const m = line.match(SIMPLE_RANGE)
+    if (!m) continue
+
+    const start = flexibleTimestampToSeconds(m[1])
+    const end = flexibleTimestampToSeconds(m[2])
+    if (start === null || end === null || !(end > start)) continue
+
+    const duration = end - start
+    pairs.push({
+      index: pairs.length,
+      shortStart: shortCursor,
+      shortEnd: shortCursor + duration,
+      movieStart: start,
+      movieEnd: end,
+      shortStartFrame: 0,
+      shortEndFrame: 0,
+      movieStartFrame: 0,
+      movieEndFrame: 0,
+      matchType: "CUT",
+      confidence: "TIMESTAMP",
+      label: `Cut ${pairs.length + 1}`,
+    })
+    shortCursor += duration
+  }
+
+  return pairs
 }
 
 // One timestamp + frame token: 00:41.000 [f984]
@@ -113,7 +204,15 @@ export function parseReport(text: string): ParsedReport {
   const summaryM = text.match(/SUMMARY:\s*(.+)/i)
   if (summaryM) verdict.summary = summaryM[1].trim()
 
-  return { pairs, verdict }
+  // No HISSA mapping lines? Fall back to the plain timestamp-range format.
+  if (pairs.length === 0) {
+    const simple = parseSimpleRanges(text)
+    if (simple.length > 0) {
+      return { pairs: simple, verdict, format: "simple" }
+    }
+  }
+
+  return { pairs, verdict, format: "hissa" }
 }
 
 export function formatSeconds(total: number): string {

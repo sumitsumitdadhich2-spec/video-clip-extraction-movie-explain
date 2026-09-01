@@ -17,14 +17,15 @@ export default function Page() {
   const [verdict, setVerdict] = useState<Verdict | null>(null)
   const [step, setStep] = useState<Step>("upload")
 
-  const handleFilesSelected = (short: File, movie: File, report: ParsedReport) => {
+  const handleFilesSelected = (short: File | null, movie: File, report: ParsedReport) => {
     resetBackground()
     setShortFile(short)
     setMovieFile(movie)
     setPairs(report.pairs)
     setVerdict(report.verdict)
-    setStep("compare")
-    // Kick off background cutting of movie clips while the user compares pairs.
+    // Movie-only mode (no short): skip compare, go straight to cut & merge.
+    setStep(short ? "compare" : "export")
+    // Kick off background cutting of movie clips right away.
     startBackgroundExtraction(movie, report.pairs)
   }
 
@@ -38,8 +39,8 @@ export default function Page() {
   }
 
   const steps: { key: Step; title: string; desc: string }[] = [
-    { key: "upload", title: "1. Upload", desc: "Short + Movie + Report" },
-    { key: "compare", title: "2. Compare", desc: "Side-by-side pair preview" },
+    { key: "upload", title: "1. Upload", desc: "Movie + Timestamps (Short optional)" },
+    { key: "compare", title: "2. Compare", desc: "Side-by-side (needs Short)" },
     { key: "export", title: "3. Merge & Export", desc: "Build the final video" },
   ]
 
@@ -53,9 +54,9 @@ export default function Page() {
             Short vs Movie — Clip Matcher &amp; Exporter
           </h1>
           <p className="mt-2 text-pretty text-slate-400">
-            Upload the short video, the full movie, and the text analysis report. Compare every matched
-            segment side by side, then cut and merge the movie clips into one exportable video — all in
-            your browser.
+            Upload the movie and paste timestamps (plain hh:mm:ss:fff / mm:ss:fff list or a full HISSA
+            report) — cuts are made from the movie, merged, and previewed. Add the short video too and
+            you also get side-by-side pair comparison. All in your browser.
           </p>
         </header>
 
@@ -122,7 +123,11 @@ export default function Page() {
           )}
 
           {step === "export" && movieFile && (
-            <ExtractionPanel movieFile={movieFile} pairs={pairs} onBack={() => setStep("compare")} />
+            <ExtractionPanel
+              movieFile={movieFile}
+              pairs={pairs}
+              onBack={() => (shortFile ? setStep("compare") : handleRestart())}
+            />
           )}
         </div>
       </div>
