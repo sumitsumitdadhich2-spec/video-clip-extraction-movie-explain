@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button"
 import { parseReport, type ParsedReport } from "@/lib/report-parser"
 
 interface VideoUploaderProps {
-  onFilesSelected: (shortFile: File, movieFile: File, report: ParsedReport) => void
+  onFilesSelected: (shortFile: File | null, movieFile: File, report: ParsedReport) => void
 }
 
 const EXAMPLE_LINE =
@@ -41,10 +41,12 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
 
   const pairCount = parsed?.pairs.length ?? 0
   const reportReady = pairCount > 0
-  const ready = !!shortFile && !!movieFile && reportReady
+  const isSimple = parsed?.format === "simple"
+  // Short is OPTIONAL — movie + timestamps alone is enough (cut & merge mode).
+  const ready = !!movieFile && reportReady
 
   const handleContinue = () => {
-    if (shortFile && movieFile && parsed && parsed.pairs.length > 0) {
+    if (movieFile && parsed && parsed.pairs.length > 0) {
       onFilesSelected(shortFile, movieFile, parsed)
     }
   }
@@ -95,7 +97,13 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
     <div className="space-y-6">
       {/* Dual video upload */}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-        {videoZone("Short Video (the clip to verify)", "border-purple-600/60", shortFile, shortInputRef, setShortFile)}
+        {videoZone(
+          "Short Video (optional — for side-by-side compare)",
+          "border-purple-600/60",
+          shortFile,
+          shortInputRef,
+          setShortFile,
+        )}
         {videoZone("Movie File (the full source)", "border-blue-600/60", movieFile, movieInputRef, setMovieFile)}
       </div>
 
@@ -103,9 +111,10 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
       <div className="rounded-lg bg-slate-800 p-5">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
           <div>
-            <span className="block text-sm font-semibold text-slate-200">Analysis Report</span>
+            <span className="block text-sm font-semibold text-slate-200">Report / Timestamp List</span>
             <p className="mt-1 text-xs text-slate-400">
-              Paste the text report — mappings are read from the HISSA 2 section.
+              Paste the HISSA report, OR a plain timestamp list — one range per line, hh:mm:ss:fff or
+              mm:ss:fff (hours optional).
             </p>
           </div>
           <div className="flex overflow-hidden rounded border border-slate-600 text-xs">
@@ -134,7 +143,7 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
           <textarea
             value={reportText}
             onChange={(e) => handleReportText(e.target.value)}
-            placeholder={`Paste the full analysis report here...\n\nMapping lines look like:\n${EXAMPLE_LINE}`}
+            placeholder={`Paste the analysis report OR a plain timestamp list here...\n\nPlain list (one range per line, hours optional):\n10:24:208 - 10:25:424\n12:15:333 - 12:16:729\n1:02:15:333 - 1:02:16:729\n\nOr HISSA mapping lines:\n${EXAMPLE_LINE}`}
             rows={8}
             spellCheck={false}
             className={`w-full resize-none rounded border bg-slate-900 p-3 font-mono text-xs text-slate-200 outline-none transition ${
@@ -172,36 +181,62 @@ export function VideoUploader({ onFilesSelected }: VideoUploaderProps) {
           <div className="mt-2 text-xs">
             {reportReady ? (
               <p className="text-emerald-400">
-                {pairCount} mapping{pairCount === 1 ? "" : "s"} found
-                {parsed?.verdict.verdict ? ` — Verdict: ${parsed.verdict.verdict}` : ""}
-                {parsed?.verdict.matched ? ` (${parsed.verdict.matched})` : ""}
+                {isSimple ? (
+                  <>
+                    {pairCount} cut{pairCount === 1 ? "" : "s"} found (plain timestamp list)
+                    {!shortFile ? " — movie-only mode: cuts will be merged directly" : ""}
+                  </>
+                ) : (
+                  <>
+                    {pairCount} mapping{pairCount === 1 ? "" : "s"} found
+                    {parsed?.verdict.verdict ? ` — Verdict: ${parsed.verdict.verdict}` : ""}
+                    {parsed?.verdict.matched ? ` (${parsed.verdict.matched})` : ""}
+                  </>
+                )}
               </p>
             ) : (
               <p className="text-red-400">
-                No mapping lines found. Expected HISSA 2 lines like: <br />
-                <code className="text-slate-400">{EXAMPLE_LINE}</code>
+                Nothing parsed. Paste HISSA lines like <code className="text-slate-400">{EXAMPLE_LINE}</code>
+                <br />
+                or plain ranges like <code className="text-slate-400">10:24:208 - 10:25:424</code> (one per
+                line).
               </p>
             )}
           </div>
         )}
       </div>
 
-      <div className="flex justify-center">
+      <div className="flex flex-col items-center gap-2">
         <Button
           onClick={handleContinue}
           disabled={!ready}
           className="bg-blue-600 px-8 hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-slate-600"
         >
-          Continue to Compare
+          {shortFile ? "Continue to Compare" : "Cut, Merge & Preview"}
         </Button>
+        {ready && !shortFile && (
+          <p className="text-xs text-slate-400">
+            No short uploaded — cuts will be made from the movie and merged directly.
+          </p>
+        )}
       </div>
 
       {/* Format reference */}
       <div className="rounded-lg bg-slate-800/60 p-4">
-        <h3 className="mb-2 text-sm font-semibold text-slate-200">Expected Report Format</h3>
+        <h3 className="mb-2 text-sm font-semibold text-slate-200">Accepted Formats</h3>
         <p className="mb-2 text-xs text-slate-400">
-          The report contains HISSA 0/1/2 sections and a FINAL VERDICT. Only HISSA 2 mapping lines are used for
-          extraction — one line per matched segment:
+          <span className="font-semibold text-slate-300">1. Plain timestamp list</span> — one movie range per
+          line. Milliseconds via <code>:fff</code> or <code>.fff</code>; hours are optional:
+        </p>
+        <pre className="mb-3 overflow-x-auto rounded bg-slate-900 p-3 text-xs leading-relaxed text-slate-300">
+          {`10:24:208 - 10:25:424          (mm:ss:fff)
+1:02:15:333 - 1:02:16:729      (hh:mm:ss:fff)
+04:14.000 - 04:17.500          (mm:ss.fff)
+12:15 - 12:20                  (mm:ss)`}
+        </pre>
+        <p className="mb-2 text-xs text-slate-400">
+          <span className="font-semibold text-slate-300">2. HISSA analysis report</span> — mapping lines from
+          the HISSA 2 section, one per matched segment:
         </p>
         <pre className="overflow-x-auto rounded bg-slate-900 p-3 text-xs leading-relaxed text-slate-300">
           {`=== HISSA 2: MAPPING ===

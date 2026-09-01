@@ -118,7 +118,22 @@ export async function exportMerged(
       args.push("-crf", "18")
     }
 
-    args.push("-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-y", outName)
+    // aresample keeps voice locked to video at every cut boundary so the
+    // concatenated export never drifts out of sync.
+    args.push(
+      "-af",
+      "aresample=async=1:first_pts=0",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k",
+      "-ar",
+      "44100",
+      "-ac",
+      "2",
+      "-y",
+      outName,
+    )
 
     await ff.exec(args)
     listLines.push(`file '${outName}'`)
