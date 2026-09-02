@@ -9,6 +9,7 @@ import { HistoryPanel } from "@/components/history-panel"
 import { Button } from "@/components/ui/button"
 import {
   processMergeInSegments,
+  processPreviewMerge,
   totalSizeOk,
   formatBytes,
   formatEta,
@@ -64,7 +65,28 @@ interface MergeJob {
   uploadsFailed: boolean
   /** True when Blob storage isn't connected — cloud saving was skipped entirely. */
   cloudSkipped: boolean
+  /** Chosen export height (720, 1080, ...) — null = original quality (stream copy). */
+  exportHeight: number | null
 }
+
+interface PreviewState {
+  running: boolean
+  status: string
+  progress: number
+  eta: number | null
+  url: string | null
+  error: string
+  movieSecIncluded: number
+  truncated: boolean
+}
+
+const QUALITY_OPTIONS: { label: string; value: number | null }[] = [
+  { label: "Original", value: null },
+  { label: "1080p", value: 1080 },
+  { label: "720p", value: 720 },
+  { label: "480p", value: 480 },
+  { label: "360p", value: 360 },
+]
 
 interface JobUploadState {
   manifest: JobManifest
@@ -79,6 +101,8 @@ export default function Page() {
   const [movieFile, setMovieFile] = useState<File | null>(null)
   const [movieTrim, setMovieTrim] = useState<MovieTrim | null>(null)
   const [jobs, setJobs] = useState<MergeJob[]>([])
+  const [exportQuality, setExportQuality] = useState<number | null>(null)
+  const [preview, setPreview] = useState<PreviewState | null>(null)
   const [resumeCandidate, setResumeCandidate] = useState<JobManifest | null>(null)
   const { mutate } = useSWRConfig()
   const uploadStates = useRef<Map<number, JobUploadState>>(new Map())
@@ -119,6 +143,69 @@ export default function Page() {
   useEffect(() => {
     setMovieTrim(null)
   }, [movieFile])
+
+  // Files or trim changed → an existing preview no longer matches; drop it.
+  // (Never interrupts a RUNNING preview — only stale finished ones.)
+  useEffect(() => {
+    setPreview((prev) => {
+      if (!prev || prev.running) return prev
+      if (prev.url) URL.revokeObjectURL(prev.url)
+      return null
+    })
+  }, [shortFile, movieFile, movieTrim])
+
+  const dismissPreview = () => {
+    setPreview((prev) => {
+      if (prev?.url) URL.revokeObjectURL(prev.url)
+      return null
+    })
+  }
+
+  // Low-quality preview: cut + merge at 360p just to CHECK the result.
+  // Export is completely separate and always uses the original files.
+  const runPreview = async () => {
+    if (!shortFile || !movieFile || preview?.running) return
+    if (preview?.url) URL.revokeObjectURL(preview.url)
+    setPreview({
+      running: true,
+      status: "Starting...",
+      progress: 0,
+      eta: null,
+      url: null,
+      error: "",
+      movieSecIncluded: 0,
+      truncated: false,
+    })
+    try {
+      const result = await processPreviewMerge(shortFile, movieFile, movieTrim, {
+        onStatus: (status) => setPreview((p) => (p ? { ...p, status } : p)),
+        onProgress: (progress) => setPreview((p) => (p ? { ...p, progress } : p)),
+        onEta: (eta) => setPreview((p) => (p ? { ...p, eta } : p)),
+      })
+      setPreview({
+        running: false,
+        status: "Preview ready",
+        progress: 100,
+        eta: null,
+        url: result.url,
+        error: "",
+        movieSecIncluded: result.movieSecIncluded,
+        truncated: result.truncated,
+      })
+    } catch (err) {
+      console.error("[v0] preview error:", err)
+      setPreview({
+        running: false,
+        status: "",
+        progress: 0,
+        eta: null,
+        url: null,
+        error: err instanceof Error && err.message ? err.message : "Preview failed. Try again.",
+        movieSecIncluded: 0,
+        truncated: false,
+      })
+    }
+  }
 
   // --- Resume detection: same files + same trim re-selected → offer resume --
   useEffect(() => {
@@ -173,15 +260,19 @@ export default function Page() {
     }
   }, [shortFile, movieFile, movieTrim])
 
-  const startMerge = (resumeFrom: JobManifest | null) => {
+  const startMerge = (resumeCandidateIn: JobManifest | null) => {
     if (!shortFile || !movieFile) return
     const a = shortFile
     const b = movieFile
-    // Snapshot the trim NOW — the state is cleared below so a parallel merge
-    // can be configured while this one runs.
+    // Snapshot the trim + quality NOW — the state is cleared below so a
+    // parallel merge can be configured while this one runs.
     const trim = movieTrim
+    const exportHeight = exportQuality
+    // Resume (saved cloud parts) only applies to original-quality exports —
+    // a re-encoded export is a different output entirely.
+    const resumeFrom = exportHeight === null ? resumeCandidateIn : null
     const id = nextJobId++
-    const downloadName = `${a.name.replace(/\.[^.]+$/, "")}_merged.mp4`
+    const downloadName = `${a.name.replace(/\.[^.]+$/, "")}_merged${exportHeight ? `_${exportHeight}p` : ""}.mp4`
 
     // Clear the pickers immediately so another merge can start in parallel.
     setShortFile(null)
@@ -208,6 +299,7 @@ export default function Page() {
         savingInBackground: false,
         uploadsFailed: false,
         cloudSkipped: false,
+        exportHeight,
       },
       ...prev,
     ])
@@ -221,7 +313,9 @@ export default function Page() {
 
         // Blob storage not connected → skip ALL cloud saving. The merge and
         // the local download work exactly the same, just without History.
-        const cloudEnabled = await isBlobConnected()
+        // Re-encoded quality exports also skip cloud saving/resume — they're
+        // one-off local downloads, separate from the resumable original path.
+        const cloudEnabled = exportHeight === null && (await isBlobConnected())
         if (!cloudEnabled) updateJob(id, { cloudSkipped: true })
 
         // FRESH start (not a resume): purge any stale cloud remnants at this
@@ -253,6 +347,8 @@ export default function Page() {
             // No cloud saving → no reason to cut the output into parts.
             // One direct stream-copy pass = much faster, no "part X of Y".
             segmented: cloudEnabled,
+            // Chosen export quality — re-encodes FROM THE ORIGINAL files.
+            exportHeight,
             onStatus: (status) => updateJob(id, { status }),
             onProcessProgress: (percent) => setCombined(id, percent, null),
             onEta: (eta) => updateJob(id, { eta }),
@@ -415,6 +511,34 @@ export default function Page() {
 
           {movieFile && <MovieTrimmer movieFile={movieFile} trim={movieTrim} onTrimChange={setMovieTrim} />}
 
+          {/* Export quality — separate from the low-quality preview */}
+          <div className="mt-4 rounded-lg border border-slate-800 bg-slate-950/60 p-4">
+            <h3 className="text-sm font-semibold text-slate-200">Export quality</h3>
+            <div className="mt-2 flex flex-wrap gap-2" role="radiogroup" aria-label="Export quality">
+              {QUALITY_OPTIONS.map((opt) => (
+                <button
+                  key={opt.label}
+                  type="button"
+                  role="radio"
+                  aria-checked={exportQuality === opt.value}
+                  onClick={() => setExportQuality(opt.value)}
+                  className={`rounded-md border px-3 py-1.5 text-xs font-semibold transition ${
+                    exportQuality === opt.value
+                      ? "border-blue-500 bg-blue-500/15 text-blue-300"
+                      : "border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+            <p className="mt-2 text-xs text-slate-500">
+              {exportQuality === null
+                ? "Original = pure stream copy from the original files (fastest, 100% quality, saved to History)."
+                : `Export re-encodes at ${exportQuality}p FROM THE ORIGINAL videos (slower — local download only, no cloud save/resume). Preview quality never affects the export.`}
+            </p>
+          </div>
+
           {!sizeOk && (
             <p className="mt-4 rounded-lg border border-amber-600/40 bg-amber-500/10 p-3 text-sm text-amber-300">
               Combined file size is too large for browser merging (limit ~{formatBytes(MAX_TOTAL_BYTES)}).
@@ -462,17 +586,84 @@ export default function Page() {
             </div>
           )}
 
-          <Button
-            onClick={() => startMerge(resumeCandidate)}
-            disabled={!canMerge}
-            className="mt-6 h-11 w-full bg-blue-600 text-base font-semibold hover:bg-blue-500 disabled:opacity-50"
-          >
-            {resumeCandidate
-              ? "Resume Merge"
-              : activeJobs > 0
-                ? `Merge Videos (${activeJobs} running — parallel OK)`
-                : "Merge Videos"}
-          </Button>
+          <div className="mt-6 grid gap-2 sm:grid-cols-2">
+            <Button
+              onClick={runPreview}
+              disabled={!canMerge || preview?.running === true}
+              variant="outline"
+              className="h-11 border-slate-700 bg-slate-800 text-base font-semibold text-slate-200 hover:bg-slate-700 disabled:opacity-50"
+            >
+              {preview?.running ? "Making preview..." : "Preview (Low Quality)"}
+            </Button>
+            <Button
+              onClick={() => startMerge(resumeCandidate)}
+              disabled={!canMerge}
+              className="h-11 bg-blue-600 text-base font-semibold hover:bg-blue-500 disabled:opacity-50"
+            >
+              {resumeCandidate && exportQuality === null
+                ? "Resume Merge"
+                : activeJobs > 0
+                  ? `Export Merge (${activeJobs} running)`
+                  : `Export Merge${exportQuality ? ` — ${exportQuality}p` : " — Original"}`}
+            </Button>
+          </div>
+
+          {/* Low-quality preview player — for checking only, never exported */}
+          {preview && (
+            <div className="mt-4 rounded-lg border border-purple-600/40 bg-purple-500/5 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-sm font-semibold text-purple-200">Low-Quality Preview (360p — checking only)</h3>
+                {!preview.running && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={dismissPreview}
+                    className="h-7 border-slate-700 bg-slate-800 px-2 text-xs text-slate-200 hover:bg-slate-700"
+                  >
+                    Dismiss
+                  </Button>
+                )}
+              </div>
+
+              {preview.running && (
+                <div className="mt-3">
+                  <div className="mb-2 flex items-center justify-between gap-3 text-sm">
+                    <span className="min-w-0 flex-1 truncate text-slate-300">{preview.status}</span>
+                    <span className="shrink-0 font-mono text-slate-400">
+                      {preview.eta !== null && preview.eta > 0 && (
+                        <span className="mr-3 text-slate-500">~{formatEta(preview.eta)} left</span>
+                      )}
+                      {preview.progress}%
+                    </span>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full bg-slate-800">
+                    <div
+                      className="h-full rounded-full bg-purple-500 transition-all duration-300"
+                      style={{ width: `${preview.progress}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {preview.error && (
+                <p className="mt-3 rounded-lg border border-red-600/40 bg-red-500/10 p-3 text-sm text-red-300">
+                  {preview.error}
+                </p>
+              )}
+
+              {preview.url && (
+                <div className="mt-3 flex flex-col gap-2">
+                  <video src={preview.url} controls className="w-full rounded-lg border border-slate-800 bg-black" />
+                  <p className="text-xs text-slate-400">
+                    This preview is low quality (360p) just to check the cut + join point.
+                    {preview.truncated &&
+                      ` It shows the short + the first ${formatTimecode(preview.movieSecIncluded)} of your selected movie section.`}{" "}
+                    The exported video is always made from the ORIGINAL files at your chosen quality.
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
 
           {activeJobs > 0 && (
             <p className="mt-2 text-center text-xs text-slate-500">
@@ -491,11 +682,15 @@ export default function Page() {
                     {job.phase === "done" && (
                       <p className="text-xs text-slate-400">
                         {formatBytes(job.sizeBytes)}
-                        {job.usedFallback
-                          ? " — short converted to match movie format (movie kept original quality)"
-                          : " — pure stream copy, 100% original quality"}
+                        {job.exportHeight
+                          ? ` — exported at ${job.exportHeight}p (re-encoded from the original videos)`
+                          : job.usedFallback
+                            ? " — short converted to match movie format (movie kept original quality)"
+                            : " — pure stream copy, 100% original quality"}
                         {job.cloudSkipped
-                          ? " · Cloud save skipped (storage not connected)"
+                          ? job.exportHeight
+                            ? " · Local download only (quality exports skip cloud save)"
+                            : " · Cloud save skipped (storage not connected)"
                           : !job.savingInBackground && !job.uploadsFailed && " · Saved to History"}
                       </p>
                     )}
@@ -533,7 +728,9 @@ export default function Page() {
                     </div>
                     {job.cloudSkipped ? (
                       <p className="mt-1.5 text-xs text-slate-500">
-                        Cloud storage not connected — saving skipped, download will still work
+                        {job.exportHeight
+                          ? `Re-encoding at ${job.exportHeight}p from the original videos — local download when done`
+                          : "Cloud storage not connected — saving skipped, download will still work"}
                       </p>
                     ) : (
                       job.totalSegments !== null &&

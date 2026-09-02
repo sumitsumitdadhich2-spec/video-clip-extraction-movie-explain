@@ -292,6 +292,10 @@ export interface SegmentedMergeHandlers {
    * Use this when cloud saving is disabled — segmentation only exists so
    * parts can upload while processing, so without uploads it's pure waste. */
   segmented?: boolean
+  /** Target output height (e.g. 720) — the final pass re-encodes the merged
+   * stream FROM THE ORIGINAL inputs at this quality. null/undefined = keep
+   * original quality (pure stream copy, no re-encoding). */
+  exportHeight?: number | null
   onStatus?: (message: string) => void
   /** Processing-only progress, 0..100 (the caller blends in upload progress). */
   onProcessProgress?: (percent: number) => void
@@ -469,7 +473,7 @@ export async function processMergeInSegments(
   resume?: ResumeOptions,
   movieTrim?: MovieTrim | null,
 ): Promise<MergeResult> {
-  const { segmented, onStatus, onProcessProgress: onProgress, onEta, onPlan, onSegmentReady } = handlers
+  const { segmented, exportHeight, onStatus, onProcessProgress: onProgress, onEta, onPlan, onSegmentReady } = handlers
 
   onStatus?.("Loading merge engine...")
   onProgress?.(1)
@@ -678,6 +682,25 @@ export async function processMergeInSegments(
     const SEG_BASE = 15
     const SEG_SPAN = 73
 
+    // Output codec: original quality = pure stream copy. A chosen export
+    // quality re-encodes the merged stream FROM THE ORIGINAL inputs at the
+    // target height (never upscales — min(target, source height)).
+    const outputCodecArgs: string[] = exportHeight
+      ? [
+          "-vf",
+          `scale=-2:'min(${exportHeight},ih)'`,
+          "-c:v",
+          "libx264",
+          "-preset",
+          "veryfast",
+          "-crf",
+          "20",
+          ...(engine.isMT ? ["-threads", "0"] : []),
+          "-c:a",
+          "copy",
+        ]
+      : ["-c", "copy"]
+
     // ONE direct full-length stream-copy pass (no parts). Used when
     // segmentation is off (cloud saving disabled) and as the safety fallback.
     const runSinglePass = async (): Promise<Blob> => {
@@ -690,8 +713,7 @@ export async function processMergeInSegments(
           "0",
           "-i",
           LIST_FILE,
-          "-c",
-          "copy",
+          ...outputCodecArgs,
           "-fflags",
           "+genpts",
           "-avoid_negative_ts",
@@ -740,8 +762,7 @@ export async function processMergeInSegments(
             "0",
             "-i",
             LIST_FILE,
-            "-c",
-            "copy",
+            ...outputCodecArgs,
             "-fflags",
             "+genpts",
             "-avoid_negative_ts",
@@ -813,7 +834,11 @@ export async function processMergeInSegments(
           onSegmentReady?.(idx, blobs[idx])
         }
       } else {
-        onStatus?.("Merging Part A + Part B (stream copy — no re-encoding)...")
+        onStatus?.(
+        exportHeight
+          ? `Merging + re-encoding at ${exportHeight}p from the original videos...`
+          : "Merging Part A + Part B (stream copy — no re-encoding)...",
+      )
         const blob = await runSinglePass()
         parts.push(blob)
         onSegmentReady?.(0, blob)
@@ -830,7 +855,11 @@ export async function processMergeInSegments(
       plan = { totalSegments: 1, segmentDurationSec: SEGMENT_DURATION_SEC, totalDurationSec }
       onPlan?.(plan)
       parts.length = 0
-      onStatus?.("Merging Part A + Part B (stream copy — no re-encoding)...")
+      onStatus?.(
+        exportHeight
+          ? `Merging + re-encoding at ${exportHeight}p from the original videos...`
+          : "Merging Part A + Part B (stream copy — no re-encoding)...",
+      )
       let blob: Blob
       try {
         blob = await runSinglePass()
@@ -908,6 +937,201 @@ export async function processMergeInSegments(
   } finally {
     // Retire the engine after EVERY job — hands WASM memory back to the
     // browser immediately, which is essential when jobs run in parallel.
+    destroyEngine(engine)
+    onEta?.(null)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Low-quality PREVIEW merge — completely separate from export.
+// Re-encodes the short + the START of the selected movie section at 360p
+// (ultrafast, high CRF) so the user can quickly CHECK the cut + join point.
+// The real export always processes the ORIGINAL files at the chosen quality.
+// ---------------------------------------------------------------------------
+
+/** How much of the (trimmed) movie is included in the preview. */
+export const PREVIEW_MOVIE_SEC = 120
+
+export interface PreviewResult {
+  url: string
+  blob: Blob
+  sizeBytes: number
+  /** Seconds of the movie section actually included in the preview. */
+  movieSecIncluded: number
+  /** True when the selected movie section is longer than the preview window. */
+  truncated: boolean
+}
+
+export interface PreviewHandlers {
+  onStatus?: (message: string) => void
+  onProgress?: (percent: number) => void
+  onEta?: (secondsRemaining: number | null) => void
+}
+
+const PREVIEW_A = "preview_a.mp4"
+const PREVIEW_B = "preview_b.mp4"
+const PREVIEW_LIST = "preview_list.txt"
+const PREVIEW_OUT = "preview_out.mp4"
+
+export async function processPreviewMerge(
+  shortFile: File,
+  movieFile: File,
+  movieTrim: MovieTrim | null,
+  handlers: PreviewHandlers = {},
+): Promise<PreviewResult> {
+  const { onStatus, onProgress, onEta } = handlers
+
+  onStatus?.("Loading preview engine...")
+  onProgress?.(1)
+  const engine = await createEngine()
+  const ff = engine.ff
+
+  const SHORT_IN = `${MOUNT_DIR}/a.${extOf(shortFile)}`
+  const MOVIE_IN = `${MOUNT_DIR}/b.${extOf(movieFile)}`
+
+  try {
+    onStatus?.("Opening files (direct disk access)...")
+    onProgress?.(3)
+    await safeUnmount(engine, MOUNT_DIR)
+    await ff.createDir(MOUNT_DIR)
+    await ff.mount(
+      WORKERFS,
+      {
+        blobs: [
+          { name: `a.${extOf(shortFile)}`, data: shortFile },
+          { name: `b.${extOf(movieFile)}`, data: movieFile },
+        ],
+      },
+      MOUNT_DIR,
+    )
+
+    onStatus?.("Analyzing files...")
+    onProgress?.(5)
+    const shortInfo = await probeFile(engine, SHORT_IN)
+    const movieInfo = await probeFile(engine, MOVIE_IN)
+
+    // Clamp the trim against the movie's real duration (same rules as export).
+    let start = 0
+    let selectedSec: number | null = movieInfo.durationSec
+    if (movieTrim && movieTrim.endSec > movieTrim.startSec) {
+      start = Math.max(0, movieTrim.startSec)
+      let end = movieTrim.endSec
+      if (movieInfo.durationSec !== null) {
+        start = Math.min(start, movieInfo.durationSec)
+        end = Math.min(end, movieInfo.durationSec)
+      }
+      selectedSec = Math.max(0, end - start)
+    }
+    const movieSecIncluded = selectedSec !== null ? Math.min(selectedSec, PREVIEW_MOVIE_SEC) : PREVIEW_MOVIE_SEC
+    const truncated = selectedSec === null || selectedSec > PREVIEW_MOVIE_SEC
+
+    // Both parts get IDENTICAL preview encode settings so the final join is
+    // a fast stream copy.
+    const anyAudio = shortInfo.audioCodec !== null || movieInfo.audioCodec !== null
+    const vf =
+      "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p"
+
+    const encodeArgs = (hasAudio: boolean): string[] => {
+      const args: string[] = []
+      if (anyAudio && !hasAudio) {
+        args.push("-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo")
+        args.push("-map", "0:v:0", "-map", "1:a:0", "-shortest")
+      }
+      args.push("-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-profile:v", "baseline")
+      if (engine.isMT) args.push("-threads", "0")
+      if (anyAudio) {
+        args.push("-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "96k")
+      } else {
+        args.push("-an")
+      }
+      return args
+    }
+
+    // 1) Encode the short at preview quality.
+    onStatus?.("Preview: converting short video (360p, fast)...")
+    const shortRet = await execWithProgress(
+      engine,
+      ["-i", SHORT_IN, ...encodeArgs(shortInfo.audioCodec !== null), "-y", PREVIEW_A],
+      { baseline: 8, span: 24, totalSec: shortInfo.durationSec, onProgress, onEta },
+    )
+    if (shortRet !== 0) {
+      console.log("[v0] preview short encode failed, logs tail:", engine.logBuffer.slice(-10).join(" | "))
+      throw new Error("Preview failed while converting the short video.")
+    }
+
+    // 2) Encode the START of the selected movie section at preview quality.
+    //    -ss BEFORE -i = instant keyframe seek; -t caps the preview length.
+    onStatus?.("Preview: converting movie section (360p, fast)...")
+    const movieArgs: string[] = []
+    if (start > 0.1) movieArgs.push("-ss", start.toFixed(3))
+    movieArgs.push("-i", MOVIE_IN, ...encodeArgs(movieInfo.audioCodec !== null))
+    movieArgs.push("-t", movieSecIncluded.toFixed(3), "-y", PREVIEW_B)
+    const movieRet = await execWithProgress(engine, movieArgs, {
+      baseline: 32,
+      span: 56,
+      totalSec: movieSecIncluded,
+      onProgress,
+      onEta,
+    })
+    if (movieRet !== 0) {
+      console.log("[v0] preview movie encode failed, logs tail:", engine.logBuffer.slice(-10).join(" | "))
+      throw new Error("Preview failed while converting the movie section.")
+    }
+
+    // 3) Join the two preview parts — pure stream copy, instant.
+    onStatus?.("Preview: joining parts...")
+    onProgress?.(90)
+    await ff.writeFile(PREVIEW_LIST, new TextEncoder().encode(`file '${PREVIEW_A}'\nfile '${PREVIEW_B}'`))
+    const joinRet = await execWithProgress(
+      engine,
+      [
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        PREVIEW_LIST,
+        "-c",
+        "copy",
+        "-fflags",
+        "+genpts",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-y",
+        PREVIEW_OUT,
+      ],
+      { baseline: 90, span: 9, totalSec: null, onProgress, onEta },
+    )
+    if (joinRet !== 0) {
+      console.log("[v0] preview join failed, logs tail:", engine.logBuffer.slice(-10).join(" | "))
+      throw new Error("Preview failed while joining the two parts.")
+    }
+
+    const data = (await ff.readFile(PREVIEW_OUT)) as Uint8Array
+    if (data.byteLength === 0) throw new Error("Preview produced an empty file.")
+    const blob = new Blob([data as BlobPart], { type: "video/mp4" })
+
+    onProgress?.(100)
+    onEta?.(null)
+    onStatus?.("Preview ready!")
+    return {
+      url: URL.createObjectURL(blob),
+      blob,
+      sizeBytes: blob.size,
+      movieSecIncluded,
+      truncated,
+    }
+  } catch (err) {
+    if (isMemoryError(err)) {
+      throw new Error("The browser ran out of memory while making the preview. Close other tabs and try again.")
+    }
+    throw err
+  } finally {
+    await safeDelete(engine, PREVIEW_A)
+    await safeDelete(engine, PREVIEW_B)
+    await safeDelete(engine, PREVIEW_LIST)
+    await safeDelete(engine, PREVIEW_OUT)
+    await safeUnmount(engine, MOUNT_DIR)
     destroyEngine(engine)
     onEta?.(null)
   }
