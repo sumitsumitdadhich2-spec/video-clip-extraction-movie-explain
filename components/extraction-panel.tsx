@@ -25,13 +25,15 @@ import type { MappingPair } from "@/lib/report-parser"
 interface ExtractionPanelProps {
   movieFile: File
   pairs: MappingPair[]
+  /** Only true when a Short was uploaded too (Compare step exists). Movie-only mode never pre-cuts. */
+  preCutInBackground?: boolean
   onBack: () => void
 }
 
 type Phase = "idle" | "extracting" | "merging" | "done" | "error"
 type ExportPhase = "idle" | "exporting" | "done" | "error"
 
-export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelProps) {
+export function ExtractionPanel({ movieFile, pairs, preCutInBackground = false, onBack }: ExtractionPanelProps) {
   const [phase, setPhase] = useState<Phase>("idle")
   const [status, setStatus] = useState("")
   const [doneCount, setDoneCount] = useState(0)
@@ -68,7 +70,10 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
   const changeMode = (next: PreviewMode) => {
     if (next === mode) return
     setMode(next)
-    setPreviewMode(next, movieFile, pairs)
+    // Passing movie + pairs restarts background cutting in the new mode; in
+    // movie-only mode we just switch the setting and cut on "Merge Clips".
+    if (preCutInBackground) setPreviewMode(next, movieFile, pairs)
+    else setPreviewMode(next)
   }
 
   const run = async () => {
