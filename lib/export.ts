@@ -9,14 +9,8 @@
 // - Custom settings → full re-encode with scale / fps / bitrate args.
 
 import type { FFmpeg } from "@ffmpeg/ffmpeg"
-import {
-  getFFmpeg,
-  ensureMovieMounted,
-  toFriendlyError,
-  isMultiThreaded,
-  buildAlignedCopyCutArgs,
-  mergeClipFilesSynced,
-} from "./ffmpeg-client"
+import { getFFmpeg, toFriendlyError, buildAlignedCopyCutArgs, mergeClipFilesSynced } from "./ffmpeg-client"
+import { planParallelism, runPool, mountFile } from "./ffmpeg-pool"
 import type { MappingPair } from "./report-parser"
 
 export interface ExportOptions {
@@ -91,11 +85,10 @@ export async function exportMerged(
   const written: string[] = []
 
   try {
-    // The movie is MOUNTED (read straight from disk) — never copied into WASM
-    // memory, which is what makes multi-GB movies workable in the browser.
+    // Clips are cut on the CPU pool (one engine per core, movie MOUNTED in
+    // each — zero copy), then merged on the main engine.
     onStatus?.("Opening original movie (direct disk access)...")
-    const exportInput = await ensureMovieMounted(ff, movieFile)
-    return await runExport(ff, exportInput, pairs, options, written, onStatus, onProgress)
+    return await runExport(ff, movieFile, pairs, options, written, onStatus, onProgress)
   } catch (err) {
     throw toFriendlyError(err, "Export failed")
   } finally {
@@ -107,7 +100,7 @@ export async function exportMerged(
 
 async function runExport(
   ff: FFmpeg,
-  exportInput: string,
+  movieFile: File,
   pairs: MappingPair[],
   options: ExportOptions,
   written: string[],
@@ -116,6 +109,7 @@ async function runExport(
 ): Promise<{ url: string; sizeBytes: number }> {
   const isOriginal =
     options.width === undefined && options.fps === undefined && options.videoBitrateMbps === undefined
+  const streamCopy = isOriginal && !!options.streamCopy
 
   // Build video filter chain
   const filters: string[] = []
@@ -133,33 +127,29 @@ async function runExport(
   }
   filters.push("format=yuv420p")
 
-  const clipNames: string[] = []
-
+  // Validate every range up front so a bad clip fails fast, before any work.
   for (let i = 0; i < pairs.length; i++) {
-    const pair = pairs[i]
-    const outName = `export_${String(i).padStart(3, "0")}.mp4`
-    const duration = pair.movieEnd - pair.movieStart
-    onStatus?.(`Exporting clip ${i + 1} of ${pairs.length} (${pair.label})...`)
-
+    const duration = pairs[i].movieEnd - pairs[i].movieStart
     if (!(duration > 0)) {
-      throw new Error(`Clip ${i + 1} (${pair.label}) has an invalid time range.`)
+      throw new Error(`Clip ${i + 1} (${pairs[i].label}) has an invalid time range.`)
     }
+  }
 
-    let args: string[]
+  const buildArgs = (input: string, pair: MappingPair, outName: string, threads: number): string[] => {
+    const duration = pair.movieEnd - pair.movieStart
 
-    if (isOriginal && options.streamCopy) {
+    if (streamCopy) {
       // Zero re-encode: bit-exact source video, keyframe-aligned cuts with
       // audio and video starting from the SAME keyframe (no per-clip A/V
       // offset that would drift after concatenation).
-      args = buildAlignedCopyCutArgs(exportInput, pair.movieStart, duration, outName)
-    } else {
-      args = ["-ss", pair.movieStart.toFixed(3), "-i", exportInput, "-t", duration.toFixed(3)]
-      // Use every available CPU core when the multi-threaded engine is
-      // active (4-6x faster re-encode).
-      if (isMultiThreaded()) {
-        args.push("-threads", "0")
-      }
-      args.push(
+      return buildAlignedCopyCutArgs(input, pair.movieStart, duration, outName)
+    }
+
+    // `-threads` before -i = decoder threads, after -i = x264 encoder threads.
+    // The pool sizes these so all parallel engines together fill every core.
+    const th = ["-threads", String(threads)]
+    const args: string[] = [...th, "-ss", pair.movieStart.toFixed(3), "-i", input, "-t", duration.toFixed(3), ...th]
+    args.push(
         "-map",
         "0:v:0",
         "-map",
@@ -198,17 +188,62 @@ async function runExport(
         "-y",
         outName,
       )
-    }
+    return args
+  }
 
-    logs.length = 0
-    written.push(outName)
-    const ret = await ff.exec(args)
+  // --- Cut every clip in PARALLEL on the CPU pool (one engine per core) ----
+  const plan = planParallelism(pairs.length, !streamCopy)
+  onStatus?.(
+    `Exporting ${pairs.length} clip${pairs.length === 1 ? "" : "s"} in parallel on ${plan.workers} CPU engine${
+      plan.workers === 1 ? "" : "s"
+    } (${plan.cores} cores)...`,
+  )
+  onProgress?.(0, pairs.length)
+
+  const results: (Uint8Array | null)[] = new Array(pairs.length).fill(null)
+  let done = 0
+
+  await runPool(pairs, plan.workers, async (worker, pair, i) => {
+    const input = await mountFile(worker, movieFile)
+    const outName = `export_${String(i).padStart(3, "0")}.mp4`
+    worker.logs.length = 0
+    const ret = await worker.ff.exec(buildArgs(input, pair, outName, plan.threadsPerWorker))
     if (ret !== 0) {
-      const tail = logs.slice(-8).join(" | ")
+      const tail = worker.logs.slice(-8).join(" | ")
+      try {
+        await worker.ff.deleteFile(outName)
+      } catch {
+        // ignore
+      }
       throw new Error(`Failed to export clip ${i + 1} (${pair.label}).${tail ? ` ffmpeg: ${tail}` : ""}`)
     }
-    clipNames.push(outName)
-    onProgress?.(i + 1, pairs.length)
+    const data = (await worker.ff.readFile(outName)) as Uint8Array
+    try {
+      await worker.ff.deleteFile(outName)
+    } catch {
+      // ignore
+    }
+    if (data.byteLength === 0) {
+      throw new Error(`Clip ${i + 1} (${pair.label}) came out empty — check its timestamps.`)
+    }
+    results[i] = data
+    done++
+    onProgress?.(done, pairs.length)
+    onStatus?.(`Exported clip ${done} of ${pairs.length} (${plan.workers} running in parallel)...`)
+  })
+
+  // --- Hand the finished clips to the main engine for the merge ------------
+  onStatus?.("Preparing clips for merge...")
+  const clipNames: string[] = []
+  for (let i = 0; i < pairs.length; i++) {
+    const data = results[i]
+    if (!data) throw new Error(`Clip ${i + 1} (${pairs[i].label}) was not produced.`)
+    const name = `export_${String(i).padStart(3, "0")}.mp4`
+    written.push(name)
+    await ff.writeFile(name, data)
+    // Drop the JS copy right away — the WASM FS now owns it.
+    results[i] = null
+    clipNames.push(name)
   }
 
   const data = await mergeClipFilesSynced(ff, clipNames, "export_concat.txt", "export_final.mp4", onStatus)

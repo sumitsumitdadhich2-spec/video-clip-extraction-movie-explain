@@ -9,6 +9,7 @@ import {
   subscribeBackground,
   getPreviewMode,
   setPreviewMode,
+  describeParallelism,
   type BackgroundState,
   type ExtractedClip,
   type PreviewMode,
@@ -56,6 +57,13 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
 
   const cachedCount = bg.clips.size
   const bgError = bg.error
+
+  // How the CPU is used for clip cutting in the current mode — one ffmpeg
+  // engine per core in Fast mode, a few multi-threaded engines in Precise.
+  const [cpuPlan, setCpuPlan] = useState<{ workers: number; cores: number; threadsPerWorker: number } | null>(null)
+  useEffect(() => {
+    setCpuPlan(describeParallelism(Math.max(1, pairs.length), mode === "precise"))
+  }, [pairs.length, mode])
 
   const changeMode = (next: PreviewMode) => {
     if (next === mode) return
@@ -147,6 +155,14 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
               <span className="text-emerald-400"> — {cachedCount} already cut in background</span>
             )}
           </p>
+          {cpuPlan && (
+            <p className="mt-1 text-xs text-slate-500">
+              CPU: {cpuPlan.cores} cores detected — cutting runs on {cpuPlan.workers} parallel ffmpeg engine
+              {cpuPlan.workers === 1 ? "" : "s"}
+              {cpuPlan.threadsPerWorker > 1 ? ` × ${cpuPlan.threadsPerWorker} threads each` : ""}
+              {bg.running ? " (working in background now)" : ""}
+            </p>
+          )}
         </div>
         <div className="flex gap-2">
           <Button
