@@ -1,12 +1,17 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import {
   completeExtraction,
   mergeClips,
   getBackgroundState,
+  subscribeBackground,
+  getPreviewMode,
+  setPreviewMode,
+  type BackgroundState,
   type ExtractedClip,
+  type PreviewMode,
 } from "@/lib/ffmpeg-client"
 import {
   exportMerged,
@@ -37,6 +42,7 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
   const [resId, setResId] = useState<string>("original")
   const [fpsId, setFpsId] = useState<string>("original")
   const [brId, setBrId] = useState<string>("original")
+  const [exportCopy, setExportCopy] = useState(true)
   const [exportPhase, setExportPhase] = useState<ExportPhase>("idle")
   const [exportStatus, setExportStatus] = useState("")
   const [exportProgress, setExportProgress] = useState(0)
@@ -44,7 +50,18 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
   const [exportSize, setExportSize] = useState(0)
   const [exportError, setExportError] = useState<string | null>(null)
 
-  const cachedCount = getBackgroundState().clips.size
+  const [mode, setMode] = useState<PreviewMode>(() => getPreviewMode())
+  const [bg, setBg] = useState<BackgroundState>(() => getBackgroundState())
+  useEffect(() => subscribeBackground(setBg), [])
+
+  const cachedCount = bg.clips.size
+  const bgError = bg.error
+
+  const changeMode = (next: PreviewMode) => {
+    if (next === mode) return
+    setMode(next)
+    setPreviewMode(next, movieFile, pairs)
+  }
 
   const run = async () => {
     setPhase("extracting")
@@ -91,6 +108,7 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
           height: res?.height,
           fps: fps?.fps,
           videoBitrateMbps: br?.mbps,
+          streamCopy: exportCopy,
         },
         {
           onStatus: setExportStatus,
@@ -159,6 +177,66 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
                 ? `${cachedCount} of ${pairs.length} clips are pre-cut; the rest will be cut now.`
                 : "Clips will be cut from the movie, then merged. Everything runs in your browser."}
           </p>
+          {bgError && (
+            <p className="mt-3 text-xs text-amber-400/90">
+              Background cutting stopped early ({bgError}). The remaining clips will be cut when you press Merge Clips.
+            </p>
+          )}
+
+          <fieldset className="mx-auto mt-5 max-w-md text-left">
+            <legend className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              Cutting mode
+            </legend>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <label
+                className={`flex cursor-pointer flex-col gap-1 rounded-md border p-3 ${
+                  mode === "fast"
+                    ? "border-blue-500 bg-blue-950/30"
+                    : "border-slate-800 bg-slate-900 hover:border-slate-700"
+                }`}
+              >
+                <span className="flex items-center gap-2 text-sm font-medium text-slate-100">
+                  <input
+                    type="radio"
+                    name="preview-mode"
+                    value="fast"
+                    checked={mode === "fast"}
+                    onChange={() => changeMode("fast")}
+                    className="accent-blue-500"
+                  />
+                  Fast
+                </span>
+                <span className="text-xs leading-relaxed text-slate-400">
+                  No re-encode — seconds per clip. Cuts snap to the nearest keyframe (may start a moment early).
+                </span>
+              </label>
+              <label
+                className={`flex cursor-pointer flex-col gap-1 rounded-md border p-3 ${
+                  mode === "precise"
+                    ? "border-blue-500 bg-blue-950/30"
+                    : "border-slate-800 bg-slate-900 hover:border-slate-700"
+                }`}
+              >
+                <span className="flex items-center gap-2 text-sm font-medium text-slate-100">
+                  <input
+                    type="radio"
+                    name="preview-mode"
+                    value="precise"
+                    checked={mode === "precise"}
+                    onChange={() => changeMode("precise")}
+                    className="accent-blue-500"
+                  />
+                  Precise
+                </span>
+                <span className="text-xs leading-relaxed text-slate-400">
+                  Frame-accurate 720p re-encode. Very slow for 4K movies (minutes per clip).
+                </span>
+              </label>
+            </div>
+            <p className="mt-2 text-xs text-slate-500">
+              Export below always re-cuts from the original at full accuracy, whichever mode you pick here.
+            </p>
+          </fieldset>
         </div>
       )}
 
@@ -241,13 +319,38 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
               </div>
             </div>
 
+            {isOriginalExport && (
+              <label className="mt-4 flex cursor-pointer items-start gap-2 text-sm text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={exportCopy}
+                  onChange={(e) => setExportCopy(e.target.checked)}
+                  disabled={exporting}
+                  className="mt-0.5 accent-blue-500"
+                />
+                <span>
+                  Fast cut (no re-encode)
+                  <span className="block text-xs leading-relaxed text-slate-500">
+                    Bit-exact source quality in seconds. Cuts snap to the nearest keyframe. Untick for
+                    frame-accurate cuts (full re-encode, very slow for 4K).
+                  </span>
+                </span>
+              </label>
+            )}
+
             <div className="mt-4 flex flex-wrap items-center gap-3">
               <Button onClick={runExport} disabled={exporting} className="bg-blue-600 hover:bg-blue-500">
-                {exporting ? "Exporting..." : isOriginalExport ? "Fast Export (Original Quality)" : "Export"}
+                {exporting
+                  ? "Exporting..."
+                  : isOriginalExport
+                    ? exportCopy
+                      ? "Fast Export (Original Quality)"
+                      : "Precise Export (Original Quality)"
+                    : "Export"}
               </Button>
-              {!isOriginalExport && !exporting && (
+              {(!isOriginalExport || !exportCopy) && !exporting && (
                 <p className="text-xs text-amber-400/90">
-                  Custom settings need a full re-encode — this can be slow in the browser.
+                  This needs a full re-encode — very slow for 4K movies in the browser.
                 </p>
               )}
             </div>
