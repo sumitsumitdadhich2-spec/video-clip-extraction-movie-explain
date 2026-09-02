@@ -18,6 +18,9 @@ export interface ExportOptions {
   height?: number
   fps?: number
   videoBitrateMbps?: number
+  // Stream copy: no decode/re-encode at all (seconds per clip). Only valid
+  // with all other settings "Original". Cuts snap to the preceding keyframe.
+  streamCopy?: boolean
 }
 
 export interface ExportHandlers {
@@ -135,45 +138,65 @@ async function runExport(
       throw new Error(`Clip ${i + 1} (${pair.label}) has an invalid time range.`)
     }
 
-    const args = [
-      "-ss",
-      pair.movieStart.toFixed(3),
-      "-i",
-      exportInput,
-      "-t",
-      duration.toFixed(3),
-      "-vf",
-      filters.join(","),
-      "-c:v",
-      "libx264",
-      "-preset",
-      isOriginal ? "veryfast" : "ultrafast",
-    ]
+    const args = ["-ss", pair.movieStart.toFixed(3), "-i", exportInput, "-t", duration.toFixed(3)]
 
-    if (options.videoBitrateMbps) {
-      const br = `${options.videoBitrateMbps}M`
-      args.push("-b:v", br, "-maxrate", br, "-bufsize", `${options.videoBitrateMbps * 2}M`)
+    if (isOriginal && options.streamCopy) {
+      // Zero re-encode: bit-exact source quality, keyframe-aligned cuts.
+      args.push(
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-sn",
+        "-dn",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-y",
+        outName,
+      )
     } else {
-      // Quality-based encode close to source quality
-      args.push("-crf", "18")
-    }
+      args.push(
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-sn",
+        "-dn",
+        "-vf",
+        filters.join(","),
+        "-c:v",
+        "libx264",
+        "-preset",
+        isOriginal ? "veryfast" : "ultrafast",
+      )
 
-    // aresample keeps voice locked to video at every cut boundary so the
-    // concatenated export never drifts out of sync.
-    args.push(
-      "-af",
-      "aresample=async=1:first_pts=0",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "192k",
-      "-ar",
-      "44100",
-      "-ac",
-      "2",
-      "-y",
-      outName,
-    )
+      if (options.videoBitrateMbps) {
+        const br = `${options.videoBitrateMbps}M`
+        args.push("-b:v", br, "-maxrate", br, "-bufsize", `${options.videoBitrateMbps * 2}M`)
+      } else {
+        // Quality-based encode close to source quality
+        args.push("-crf", "18")
+      }
+
+      // aresample keeps voice locked to video at every cut boundary so the
+      // concatenated export never drifts out of sync.
+      args.push(
+        "-af",
+        "aresample=async=1:first_pts=0",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-y",
+        outName,
+      )
+    }
 
     logs.length = 0
     written.push(outName)

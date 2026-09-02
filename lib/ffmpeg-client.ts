@@ -168,30 +168,64 @@ export async function ensureMovieMounted(ff: FFmpeg, movieFile: File): Promise<s
   return path
 }
 
-// Preview clips are capped at 720p. The preview only needs to be watchable;
-// the Export step always re-cuts from the original at the chosen quality.
-// This keeps per-clip encode time and WASM memory small for 4K movies.
+// ---------------------------------------------------------------------------
+// Preview cutting mode
+//
+// "fast"    — stream copy (-c copy). No decoding / encoding at all, so a clip
+//             takes seconds instead of minutes. Cuts snap to the nearest
+//             keyframe before the start time (typically 0–3 s early).
+// "precise" — frame-accurate re-encode to 720p H.264. Very slow for 4K sources
+//             because single-threaded WASM must decode every 4K frame.
+//
+// Export always re-cuts from the original at the chosen quality, so the
+// preview mode never affects the final file.
+// ---------------------------------------------------------------------------
+export type PreviewMode = "fast" | "precise"
+
+const PREVIEW_MODE_KEY = "clipper.previewMode"
+let previewMode: PreviewMode = (() => {
+  if (typeof window === "undefined") return "fast"
+  const saved = window.localStorage.getItem(PREVIEW_MODE_KEY)
+  return saved === "precise" ? "precise" : "fast"
+})()
+
+export function getPreviewMode(): PreviewMode {
+  return previewMode
+}
+
+// Preview clips in precise mode are capped at 720p — the preview only needs to
+// be watchable, and this keeps encode time and WASM memory small for 4K.
 const PREVIEW_MAX_HEIGHT = 720
 
-// Extracts a single movie-side clip, re-encoding to normalized H.264/AAC MP4
-// so all clips can be safely concatenated afterwards. Frame-accurate via
-// -ss before -i + re-encode.
-async function extractOneClip(ff: FFmpeg, movieFile: File, pair: MappingPair): Promise<ExtractedClip> {
-  const input = await ensureMovieMounted(ff, movieFile)
-  const outName = `clip_${String(pair.index).padStart(3, "0")}.mp4`
-  const duration = pair.movieEnd - pair.movieStart
-  if (!(duration > 0)) {
-    throw new Error(`Clip ${pair.index + 1} (${pair.label}) has an invalid time range.`)
+function buildCutArgs(mode: PreviewMode, input: string, pair: MappingPair, duration: number, outName: string) {
+  const head = ["-ss", pair.movieStart.toFixed(3), "-i", input, "-t", duration.toFixed(3)]
+  if (mode === "fast") {
+    return [
+      ...head,
+      // Only the first video + first audio stream; drop subtitles/data so the
+      // concat step never sees mismatched stream layouts.
+      "-map",
+      "0:v:0",
+      "-map",
+      "0:a:0?",
+      "-sn",
+      "-dn",
+      "-c",
+      "copy",
+      "-avoid_negative_ts",
+      "make_zero",
+      "-y",
+      outName,
+    ]
   }
-
-  logBuffer = []
-  const ret = await ff.exec([
-    "-ss",
-    pair.movieStart.toFixed(3),
-    "-i",
-    input,
-    "-t",
-    duration.toFixed(3),
+  return [
+    ...head,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0?",
+    "-sn",
+    "-dn",
     "-vf",
     `scale=-2:'min(${PREVIEW_MAX_HEIGHT},ih)',scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=24,format=yuv420p`,
     "-c:v",
@@ -212,7 +246,20 @@ async function extractOneClip(ff: FFmpeg, movieFile: File, pair: MappingPair): P
     "2",
     "-y",
     outName,
-  ])
+  ]
+}
+
+// Extracts a single movie-side clip according to the current preview mode.
+async function extractOneClip(ff: FFmpeg, movieFile: File, pair: MappingPair): Promise<ExtractedClip> {
+  const input = await ensureMovieMounted(ff, movieFile)
+  const outName = `clip_${String(pair.index).padStart(3, "0")}.mp4`
+  const duration = pair.movieEnd - pair.movieStart
+  if (!(duration > 0)) {
+    throw new Error(`Clip ${pair.index + 1} (${pair.label}) has an invalid time range.`)
+  }
+
+  logBuffer = []
+  const ret = await ff.exec(buildCutArgs(previewMode, input, pair, duration, outName))
 
   if (ret !== 0) {
     const tail = logBuffer.slice(-8).join(" | ")
@@ -303,6 +350,27 @@ export function resetBackground() {
   bgState.error = null
   movieMountedFor = null
   notifyBg()
+}
+
+/**
+ * Switches the preview cutting mode. Already-cut clips are discarded (they
+ * were produced with different settings) and background cutting restarts in
+ * the new mode when a movie + pairs are supplied.
+ */
+export function setPreviewMode(mode: PreviewMode, movieFile?: File, pairs?: MappingPair[]) {
+  if (mode === previewMode) return
+  previewMode = mode
+  try {
+    window.localStorage.setItem(PREVIEW_MODE_KEY, mode)
+  } catch {
+    // storage unavailable — ignore
+  }
+  const mounted = movieMountedFor
+  resetBackground()
+  // resetBackground clears the mount marker so a new movie re-mounts; the same
+  // File is still mounted inside ffmpeg, so restore the marker to skip a remount.
+  movieMountedFor = mounted
+  if (movieFile && pairs && pairs.length > 0) startBackgroundExtraction(movieFile, pairs)
 }
 
 // Kicks off sequential background cutting of all movie-side clips.
