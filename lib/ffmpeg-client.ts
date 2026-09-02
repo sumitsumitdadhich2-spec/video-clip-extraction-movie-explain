@@ -2,46 +2,38 @@
 
 import { FFmpeg } from "@ffmpeg/ffmpeg"
 import type { FFFSType } from "@ffmpeg/ffmpeg"
-import { toBlobURL } from "@ffmpeg/util"
 import type { MappingPair } from "./report-parser"
+import {
+  loadEngine,
+  planParallelism,
+  runPool,
+  mountFile,
+  terminatePool,
+  type ParallelPlan,
+  type PoolWorker,
+} from "./ffmpeg-pool"
 
-// Core + wasm are self-hosted from /public/ffmpeg (same-origin) and passed as
-// blob URLs. The @ffmpeg/ffmpeg wrapper is bundled by Next, so its Web Worker
-// is already same-origin — we must NOT override classWorkerURL, otherwise the
-// worker's internal importScripts of the core fails.
-// The single-threaded core does NOT need SharedArrayBuffer / cross-origin
-// isolation, so it runs in the standard preview environment.
-const CORE_JS = "/ffmpeg/ffmpeg-core.js"
-const CORE_WASM = "/ffmpeg/ffmpeg-core.wasm"
+// The MAIN engine (below) handles mounting + merging. Clip cutting itself runs
+// on the CPU worker pool in ./ffmpeg-pool — one ffmpeg engine per core — so
+// every core is busy even in stream-copy mode, where a single ffmpeg run is
+// strictly single-threaded.
 
-// Self-hosted MULTI-THREADED core — uses ALL CPU cores when re-encoding
-// (precise preview mode), 4-6x faster on multi-core devices. Requires
-// SharedArrayBuffer (cross-origin isolation), so we feature-detect and fall
-// back to the single-threaded core when the browser/embedding context
-// doesn't allow it. Same MT files the merge tool already ships.
-const CORE_MT_JS = "/ffmpeg-mt/ffmpeg-core.js"
-const CORE_MT_WASM = "/ffmpeg-mt/ffmpeg-core.wasm"
-const CORE_MT_WORKER = "/ffmpeg-mt/ffmpeg-core.worker.js"
-
-/** True when the page is cross-origin isolated and SharedArrayBuffer exists. */
-function multiThreadAvailable(): boolean {
-  try {
-    return (
-      typeof SharedArrayBuffer !== "undefined" &&
-      typeof crossOriginIsolated !== "undefined" &&
-      crossOriginIsolated === true
-    )
-  } catch {
-    return false
-  }
-}
-
-// True when the currently loaded engine is the multi-threaded core.
+// True when the currently loaded main engine is the multi-threaded core.
 let engineIsMT = false
 
-/** Whether the active clip-cutting engine runs on all CPU cores. */
+/** Whether the active merge engine runs on all CPU cores. */
 export function isMultiThreaded(): boolean {
   return engineIsMT
+}
+
+/** Human-readable summary of how clip cutting will use the CPU. */
+export function describeParallelism(taskCount: number, reencode: boolean): ParallelPlan {
+  return planParallelism(taskCount, reencode)
+}
+
+/** `-threads N` for both the decoder (input side) and encoder (output side). */
+function threadArgs(threads: number): string[] {
+  return ["-threads", String(threads)]
 }
 
 // FFFSType.WORKERFS as a value — the enum isn't exported from the package's
@@ -73,27 +65,7 @@ export async function getFFmpeg(onLog?: LogHandler): Promise<FFmpeg> {
     // Prefer the multi-threaded core (all CPU cores) and fall back to the
     // single-threaded core when SharedArrayBuffer isn't available or the MT
     // core fails to initialize.
-    engineIsMT = false
-    if (multiThreadAvailable()) {
-      try {
-        await instance.load({
-          coreURL: await toBlobURL(CORE_MT_JS, "text/javascript"),
-          wasmURL: await toBlobURL(CORE_MT_WASM, "application/wasm"),
-          workerURL: await toBlobURL(CORE_MT_WORKER, "text/javascript"),
-        })
-        engineIsMT = true
-        ffmpeg = instance
-        return instance
-      } catch {
-        // MT core failed to load — fall through to the single-threaded core.
-      }
-    }
-
-    await instance.load({
-      coreURL: await toBlobURL(CORE_JS, "text/javascript"),
-      wasmURL: await toBlobURL(CORE_WASM, "application/wasm"),
-    })
-
+    engineIsMT = await loadEngine(instance)
     ffmpeg = instance
     return instance
   })()
@@ -123,6 +95,9 @@ export function resetFFmpeg() {
   logBuffer = []
   movieMountedFor = null
   engineIsMT = false
+  // Retire the cutting pool too — a crash usually means memory pressure, and
+  // fresh engines hand every byte back to the browser.
+  terminatePool()
 }
 
 function isCrashError(err: unknown): boolean {
@@ -290,13 +265,18 @@ export function buildAlignedCopyCutArgs(input: string, startSec: number, duratio
  * encoding is cheap — a few seconds even for long outputs.
  */
 export function buildSyncedConcatArgs(listFile: string, outName: string) {
+  // Decoder (input) + encoder (output) threads on all cores when the MT core
+  // is active — only the audio is re-packed here, but it's free to spread.
+  const th = engineIsMT ? threadArgs(0) : []
   return [
+    ...th,
     "-f",
     "concat",
     "-safe",
     "0",
     "-i",
     listFile,
+    ...th,
     "-map",
     "0:v:0",
     "-map",
@@ -372,14 +352,17 @@ export async function probeClip(ff: FFmpeg, name: string): Promise<ClipProbe> {
  */
 export function buildReencodeConcatArgs(listFile: string, outName: string, fps: number | null) {
   const cfr = fps && fps > 0 ? ["-r", fps.toFixed(3), "-fps_mode", "cfr"] : ["-fps_mode", "cfr"]
+  // All cores for BOTH the decoder (before -i) and the x264 encoder (after).
+  const th = engineIsMT ? threadArgs(0) : []
   return [
+    ...th,
     "-f",
     "concat",
     "-safe",
     "0",
     "-i",
     listFile,
-    ...(engineIsMT ? ["-threads", "0"] : []),
+    ...th,
     "-map",
     "0:v:0",
     "-map",
@@ -496,16 +479,25 @@ export async function mergeClipFilesSynced(
   return data
 }
 
-function buildCutArgs(mode: PreviewMode, input: string, pair: MappingPair, duration: number, outName: string) {
+function buildCutArgs(
+  mode: PreviewMode,
+  input: string,
+  pair: MappingPair,
+  duration: number,
+  outName: string,
+  threads: number,
+) {
   if (mode === "fast") {
     return buildAlignedCopyCutArgs(input, pair.movieStart, duration, outName)
   }
-  const head = ["-ss", pair.movieStart.toFixed(3), "-i", input, "-t", duration.toFixed(3)]
+  // `-threads` BEFORE -i → decoder threads; AFTER -i → x264 encoder threads.
+  // The pool decides how many threads each parallel engine gets so the sum
+  // across engines matches the machine's core count.
+  const th = threadArgs(threads)
+  const head = [...th, "-ss", pair.movieStart.toFixed(3), "-i", input, "-t", duration.toFixed(3)]
   return [
     ...head,
-    // Use every available CPU core when the MT engine is active (4-6x faster
-    // re-encode). Harmless no-op on the single-threaded core.
-    ...(engineIsMT ? ["-threads", "0"] : []),
+    ...th,
     "-map",
     "0:v:0",
     "-map",
@@ -540,20 +532,27 @@ function buildCutArgs(mode: PreviewMode, input: string, pair: MappingPair, durat
   ]
 }
 
-// Extracts a single movie-side clip according to the current preview mode.
-async function extractOneClip(ff: FFmpeg, movieFile: File, pair: MappingPair): Promise<ExtractedClip> {
-  const input = await ensureMovieMounted(ff, movieFile)
+// Extracts a single movie-side clip on a POOL worker according to the current
+// preview mode. Many of these run at the same time — one per CPU core.
+async function extractOneClip(
+  worker: PoolWorker,
+  movieFile: File,
+  pair: MappingPair,
+  threads: number,
+): Promise<ExtractedClip> {
+  const ff = worker.ff
+  const input = await mountFile(worker, movieFile)
   const outName = `clip_${String(pair.index).padStart(3, "0")}.mp4`
   const duration = pair.movieEnd - pair.movieStart
   if (!(duration > 0)) {
     throw new Error(`Clip ${pair.index + 1} (${pair.label}) has an invalid time range.`)
   }
 
-  logBuffer = []
-  const ret = await ff.exec(buildCutArgs(previewMode, input, pair, duration, outName))
+  worker.logs.length = 0
+  const ret = await ff.exec(buildCutArgs(previewMode, input, pair, duration, outName, threads))
 
   if (ret !== 0) {
-    const tail = logBuffer.slice(-8).join(" | ")
+    const tail = worker.logs.slice(-8).join(" | ")
     await safeDelete(ff, outName)
     throw new Error(`Failed to cut clip ${pair.index + 1} (${pair.label}).${tail ? ` ffmpeg: ${tail}` : ""}`)
   }
@@ -664,8 +663,41 @@ export function setPreviewMode(mode: PreviewMode, movieFile?: File, pairs?: Mapp
   if (movieFile && pairs && pairs.length > 0) startBackgroundExtraction(movieFile, pairs)
 }
 
-// Kicks off sequential background cutting of all movie-side clips.
-// Safe to call multiple times — no-ops if already running for the same set.
+/**
+ * Cuts every pair in `todo` on the CPU pool — one ffmpeg engine per core —
+ * and stores each finished clip in the background cache as it lands.
+ * `isStale` cancels scheduling when the session has been reset.
+ */
+async function cutPairsParallel(
+  movieFile: File,
+  todo: MappingPair[],
+  isStale: () => boolean,
+  onClip?: (doneCount: number, total: number) => void,
+): Promise<ParallelPlan> {
+  const plan = planParallelism(todo.length, previewMode === "precise")
+  await runPool(
+    todo,
+    plan.workers,
+    async (worker, pair) => {
+      if (isStale()) return
+      if (bgState.clips.has(pair.index)) return
+      const clip = await extractOneClip(worker, movieFile, pair, plan.threadsPerWorker)
+      if (isStale()) {
+        URL.revokeObjectURL(clip.url)
+        return
+      }
+      bgState.clips.set(pair.index, clip)
+      bgState.doneCount = bgState.clips.size
+      notifyBg()
+      onClip?.(bgState.doneCount, bgState.total)
+    },
+    isStale,
+  )
+  return plan
+}
+
+// Kicks off PARALLEL background cutting of all movie-side clips across every
+// CPU core. Safe to call multiple times — no-ops if already running.
 export function startBackgroundExtraction(movieFile: File, pairs: MappingPair[]) {
   if (bgState.running) return
   if (bgState.total === pairs.length && bgState.doneCount === pairs.length) return
@@ -678,22 +710,14 @@ export function startBackgroundExtraction(movieFile: File, pairs: MappingPair[])
 
   ;(async () => {
     try {
-      const ff = await getFFmpeg()
-      await ensureMovieMounted(ff, movieFile)
-      if (session !== bgSessionId) return
+      // Warm the main (merge) engine in parallel with the first cuts so the
+      // merge step never waits on an engine load later.
+      void getFFmpeg().catch(() => {})
 
-      for (const pair of pairs) {
-        if (session !== bgSessionId) return
-        if (bgState.clips.has(pair.index)) continue
-        const clip = await extractOneClip(ff, movieFile, pair)
-        if (session !== bgSessionId) {
-          URL.revokeObjectURL(clip.url)
-          return
-        }
-        bgState.clips.set(pair.index, clip)
-        bgState.doneCount = bgState.clips.size
-        notifyBg()
-      }
+      const todo = pairs.filter((p) => !bgState.clips.has(p.index))
+      const plan = await cutPairsParallel(movieFile, todo, () => session !== bgSessionId)
+      if (session !== bgSessionId) return
+      console.log(`[v0] background cutting done on ${plan.workers} parallel engines (${plan.cores} cores)`)
 
       bgState.running = false
       notifyBg()
@@ -734,25 +758,36 @@ export async function completeExtraction(
   }
 
   try {
-    const ff = await getFFmpeg()
-    await ensureMovieMounted(ff, movieFile)
+    // Make sure the merge engine is ready (loads while clips are cut).
+    const engineReady = getFFmpeg()
+
+    const todo = pairs.filter((p) => !bgState.clips.has(p.index))
+    bgState.total = pairs.length
+    if (todo.length > 0) {
+      const plan = planParallelism(todo.length, previewMode === "precise")
+      onStatus?.(
+        `Cutting ${todo.length} clip${todo.length === 1 ? "" : "s"} in parallel on ${plan.workers} CPU engine${
+          plan.workers === 1 ? "" : "s"
+        } (${plan.cores} cores)...`,
+      )
+      onClipDone?.(bgState.clips.size, pairs.length)
+      await cutPairsParallel(
+        movieFile,
+        todo,
+        () => false,
+        (done, total) => onClipDone?.(done, total),
+      )
+    }
+
+    await engineReady
 
     const results: ExtractedClip[] = []
     for (const pair of pairs) {
-      const cached = bgState.clips.get(pair.index)
-      if (cached) {
-        results.push(cached)
-        onClipDone?.(results.length, pairs.length)
-        continue
-      }
-      onStatus?.(`Cutting clip ${pair.index + 1} of ${pairs.length} (${pair.label})...`)
-      const clip = await extractOneClip(ff, movieFile, pair)
-      bgState.clips.set(pair.index, clip)
-      bgState.doneCount = bgState.clips.size
-      notifyBg()
+      const clip = bgState.clips.get(pair.index)
+      if (!clip) throw new Error(`Clip ${pair.index + 1} (${pair.label}) was not produced.`)
       results.push(clip)
-      onClipDone?.(results.length, pairs.length)
     }
+    onClipDone?.(results.length, pairs.length)
 
     return results.sort((a, b) => a.index - b.index)
   } catch (err) {

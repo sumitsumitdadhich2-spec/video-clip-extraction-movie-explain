@@ -605,7 +605,9 @@ export async function processMergeInSegments(
       const movieHasAudio = movieInfo.audioCodec !== null
       const shortHasAudio = shortInfo.audioCodec !== null
 
-      const args: string[] = ["-i", SHORT_IN]
+      // `-threads 0` BEFORE -i = multi-threaded DECODE of the short as well
+      // (not just the encode) when the MT core is active.
+      const args: string[] = engine.isMT ? ["-threads", "0", "-i", SHORT_IN] : ["-i", SHORT_IN]
       if (movieHasAudio && !shortHasAudio) {
         args.push("-f", "lavfi", "-i", `anullsrc=r=${targetSR}:cl=stereo`)
       }
