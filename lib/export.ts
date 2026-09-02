@@ -8,8 +8,8 @@
 //   while keeping cuts frame-accurate.
 // - Custom settings → full re-encode with scale / fps / bitrate args.
 
-import { fetchFile } from "@ffmpeg/util"
-import { getFFmpeg } from "./ffmpeg-client"
+import type { FFmpeg } from "@ffmpeg/ffmpeg"
+import { getFFmpeg, ensureMovieMounted, toFriendlyError } from "./ffmpeg-client"
 import type { MappingPair } from "./report-parser"
 
 export interface ExportOptions {
@@ -50,8 +50,20 @@ export const BITRATE_PRESETS = [
   { id: "50", label: "50 Mbps", mbps: 50 },
 ] as const
 
-const EXPORT_INPUT = "export_source.mp4"
-let exportSourceFor: File | null = null
+// Bounded tail of ffmpeg log lines for readable export error messages.
+const logs: string[] = []
+const tapLog = (m: string) => {
+  logs.push(m)
+  if (logs.length > 200) logs.splice(0, logs.length - 100)
+}
+
+async function safeDelete(ff: FFmpeg, name: string) {
+  try {
+    await ff.deleteFile(name)
+  } catch {
+    // ignore
+  }
+}
 
 export async function exportMerged(
   movieFile: File,
@@ -60,14 +72,38 @@ export async function exportMerged(
   handlers: ExportHandlers = {},
 ): Promise<{ url: string; sizeBytes: number }> {
   const { onStatus, onProgress } = handlers
-  const ff = await getFFmpeg()
+  if (pairs.length === 0) throw new Error("No clips to export.")
 
-  onStatus?.("Loading original movie into the engine...")
-  if (exportSourceFor !== movieFile) {
-    await ff.writeFile(EXPORT_INPUT, await fetchFile(movieFile))
-    exportSourceFor = movieFile
+  // getFFmpeg dedupes handlers by reference, so this module-level tap is
+  // registered exactly once no matter how many exports run.
+  const ff = await getFFmpeg(tapLog)
+
+  const written: string[] = []
+
+  try {
+    // The movie is MOUNTED (read straight from disk) — never copied into WASM
+    // memory, which is what makes multi-GB movies workable in the browser.
+    onStatus?.("Opening original movie (direct disk access)...")
+    const exportInput = await ensureMovieMounted(ff, movieFile)
+    return await runExport(ff, exportInput, pairs, options, written, onStatus, onProgress)
+  } catch (err) {
+    throw toFriendlyError(err, "Export failed")
+  } finally {
+    for (const name of written) await safeDelete(ff, name)
+    await safeDelete(ff, "export_concat.txt")
+    await safeDelete(ff, "export_final.mp4")
   }
+}
 
+async function runExport(
+  ff: FFmpeg,
+  exportInput: string,
+  pairs: MappingPair[],
+  options: ExportOptions,
+  written: string[],
+  onStatus?: (message: string) => void,
+  onProgress?: (done: number, total: number) => void,
+): Promise<{ url: string; sizeBytes: number }> {
   const isOriginal =
     options.width === undefined && options.fps === undefined && options.videoBitrateMbps === undefined
 
@@ -95,11 +131,15 @@ export async function exportMerged(
     const duration = pair.movieEnd - pair.movieStart
     onStatus?.(`Exporting clip ${i + 1} of ${pairs.length} (${pair.label})...`)
 
+    if (!(duration > 0)) {
+      throw new Error(`Clip ${i + 1} (${pair.label}) has an invalid time range.`)
+    }
+
     const args = [
       "-ss",
       pair.movieStart.toFixed(3),
       "-i",
-      EXPORT_INPUT,
+      exportInput,
       "-t",
       duration.toFixed(3),
       "-vf",
@@ -135,14 +175,21 @@ export async function exportMerged(
       outName,
     )
 
-    await ff.exec(args)
+    logs.length = 0
+    written.push(outName)
+    const ret = await ff.exec(args)
+    if (ret !== 0) {
+      const tail = logs.slice(-8).join(" | ")
+      throw new Error(`Failed to export clip ${i + 1} (${pair.label}).${tail ? ` ffmpeg: ${tail}` : ""}`)
+    }
     listLines.push(`file '${outName}'`)
     onProgress?.(i + 1, pairs.length)
   }
 
   onStatus?.("Merging exported clips...")
   await ff.writeFile("export_concat.txt", new TextEncoder().encode(listLines.join("\n")))
-  await ff.exec([
+  logs.length = 0
+  const mergeRet = await ff.exec([
     "-f",
     "concat",
     "-safe",
@@ -151,21 +198,21 @@ export async function exportMerged(
     "export_concat.txt",
     "-c",
     "copy",
+    "-fflags",
+    "+genpts",
+    "-avoid_negative_ts",
+    "make_zero",
     "-y",
     "export_final.mp4",
   ])
+  if (mergeRet !== 0) {
+    const tail = logs.slice(-8).join(" | ")
+    throw new Error(`Merging the exported clips failed.${tail ? ` ffmpeg: ${tail}` : ""}`)
+  }
 
   const data = (await ff.readFile("export_final.mp4")) as Uint8Array
+  if (data.byteLength === 0) throw new Error("Exported video came out empty.")
   const blob = new Blob([data as BlobPart], { type: "video/mp4" })
-
-  // Clean up intermediate export files to free WASM FS memory
-  for (let i = 0; i < pairs.length; i++) {
-    try {
-      await ff.deleteFile(`export_${String(i).padStart(3, "0")}.mp4`)
-    } catch {
-      // ignore
-    }
-  }
 
   onStatus?.("Export complete.")
   return { url: URL.createObjectURL(blob), sizeBytes: blob.size }

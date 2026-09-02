@@ -44,7 +44,9 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
   const [exportSize, setExportSize] = useState(0)
   const [exportError, setExportError] = useState<string | null>(null)
 
-  const cachedCount = getBackgroundState().clips.size
+  const bg = getBackgroundState()
+  const cachedCount = bg.clips.size
+  const bgError = bg.error
 
   const run = async () => {
     setPhase("extracting")
@@ -159,6 +161,11 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
                 ? `${cachedCount} of ${pairs.length} clips are pre-cut; the rest will be cut now.`
                 : "Clips will be cut from the movie, then merged. Everything runs in your browser."}
           </p>
+          {bgError && (
+            <p className="mt-3 text-xs text-amber-400/90">
+              Background cutting stopped early ({bgError}). The remaining clips will be cut when you press Merge Clips.
+            </p>
+          )}
         </div>
       )}
 
