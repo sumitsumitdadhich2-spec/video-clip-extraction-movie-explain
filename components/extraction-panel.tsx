@@ -207,7 +207,8 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
                   Fast
                 </span>
                 <span className="text-xs leading-relaxed text-slate-400">
-                  No re-encode — seconds per clip. Cuts snap to the nearest keyframe (may start a moment early).
+                  No re-encode — seconds per clip. Cuts snap to the nearest keyframe (may start a moment
+                  early); audio and video are kept aligned so the merged voice stays in sync.
                 </span>
               </label>
               <label
@@ -229,7 +230,8 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
                   Precise
                 </span>
                 <span className="text-xs leading-relaxed text-slate-400">
-                  Frame-accurate 720p re-encode. Very slow for 4K movies (minutes per clip).
+                  Frame-accurate cuts at the source&apos;s own resolution and frame rate (no downscale, no fps
+                  change). Re-encodes video, so it is slow for 4K movies (minutes per clip).
                 </span>
               </label>
             </div>
@@ -329,10 +331,11 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
                   className="mt-0.5 accent-blue-500"
                 />
                 <span>
-                  Fast cut (no re-encode)
+                  Fast cut (no video re-encode)
                   <span className="block text-xs leading-relaxed text-slate-500">
-                    Bit-exact source quality in seconds. Cuts snap to the nearest keyframe. Untick for
-                    frame-accurate cuts (full re-encode, very slow for 4K).
+                    Bit-exact source video in seconds; audio is re-synced to picture at every join so voice
+                    never drifts. Cuts snap to the nearest keyframe. Untick for frame-accurate cuts (full
+                    re-encode, very slow for 4K).
                   </span>
                 </span>
               </label>

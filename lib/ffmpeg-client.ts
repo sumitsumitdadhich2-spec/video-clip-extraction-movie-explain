@@ -243,31 +243,264 @@ export function getPreviewMode(): PreviewMode {
   return previewMode
 }
 
-// Preview clips in precise mode are capped at 720p — the preview only needs to
-// be watchable, and this keeps encode time and WASM memory small for 4K.
-const PREVIEW_MAX_HEIGHT = 720
+/**
+ * Stream-copy cut args with A/V starts ALIGNED.
+ *
+ * With `-c copy` ffmpeg cannot drop video frames, so video always begins at
+ * the keyframe before `-ss` — but by default it still trims audio exactly at
+ * `-ss`. That leaves every clip with audio starting later than its video.
+ * A single clip plays fine, but once clips are concatenated those per-clip
+ * offsets stack up and the voice drifts. `-noaccurate_seek` makes ffmpeg
+ * keep BOTH streams from the same keyframe, so each clip is internally
+ * consistent and concat can't introduce drift.
+ */
+export function buildAlignedCopyCutArgs(input: string, startSec: number, durationSec: number, outName: string) {
+  return [
+    "-ss",
+    startSec.toFixed(3),
+    "-noaccurate_seek",
+    "-i",
+    input,
+    "-t",
+    durationSec.toFixed(3),
+    // Only the first video + first audio stream; drop subtitles/data so the
+    // concat step never sees mismatched stream layouts.
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0?",
+    "-sn",
+    "-dn",
+    "-c",
+    "copy",
+    "-avoid_negative_ts",
+    "make_zero",
+    "-y",
+    outName,
+  ]
+}
+
+/**
+ * Concat-demuxer merge args that keep voice locked to picture.
+ *
+ * Video is a pure stream copy (zero quality loss, instant). Audio is the ONLY
+ * thing re-packed: `aresample=async=1` re-anchors every audio sample to the
+ * concat timeline, padding/trimming the tiny frame-boundary gaps between
+ * clips that would otherwise accumulate into audible desync. Audio-only
+ * encoding is cheap — a few seconds even for long outputs.
+ */
+export function buildSyncedConcatArgs(listFile: string, outName: string) {
+  return [
+    "-f",
+    "concat",
+    "-safe",
+    "0",
+    "-i",
+    listFile,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0?",
+    "-c:v",
+    "copy",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "192k",
+    "-af",
+    "aresample=async=1:min_hard_comp=0.100:first_pts=0",
+    "-fflags",
+    "+genpts",
+    "-avoid_negative_ts",
+    "make_zero",
+    "-y",
+    outName,
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Bulletproof merge (shared by Page 2 preview merge and Export)
+// ---------------------------------------------------------------------------
+
+export interface ClipProbe {
+  durationSec: number | null
+  width: number | null
+  height: number | null
+  fps: number | null
+  videoCodec: string | null
+}
+
+function parseClipProbe(lines: string[]): ClipProbe {
+  const info: ClipProbe = { durationSec: null, width: null, height: null, fps: null, videoCodec: null }
+  for (const line of lines) {
+    if (info.durationSec === null) {
+      const m = line.match(/Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)/)
+      if (m) info.durationSec = Number.parseInt(m[1], 10) * 3600 + Number.parseInt(m[2], 10) * 60 + Number.parseFloat(m[3])
+    }
+    if (info.videoCodec === null && line.includes("Video:")) {
+      const c = line.match(/Video:\s*(\w+)/)
+      if (c) info.videoCodec = c[1]
+      const d = line.match(/(\d{2,5})x(\d{2,5})/)
+      if (d) {
+        info.width = Number.parseInt(d[1], 10)
+        info.height = Number.parseInt(d[2], 10)
+      }
+      const f = line.match(/([\d.]+)\s*fps/)
+      if (f) info.fps = Number.parseFloat(f[1])
+    }
+  }
+  return info
+}
+
+/** `ffmpeg -i file` prints full stream info then exits non-zero (no output). */
+export async function probeClip(ff: FFmpeg, name: string): Promise<ClipProbe> {
+  logBuffer = []
+  try {
+    await ff.exec(["-hide_banner", "-i", name])
+  } catch {
+    // expected — no output requested
+  }
+  return parseClipProbe(logBuffer)
+}
+
+/**
+ * Full re-encode merge that preserves the SOURCE resolution and frame rate
+ * exactly (no scale, no fps change), used only when the stream-copy merge is
+ * unsafe (mismatched clip params) or fails verification. Constant-frame-rate
+ * output at the probed fps guarantees the video timeline is rigid, and
+ * aresample pins the audio to it — no drift possible.
+ */
+export function buildReencodeConcatArgs(listFile: string, outName: string, fps: number | null) {
+  const cfr = fps && fps > 0 ? ["-r", fps.toFixed(3), "-fps_mode", "cfr"] : ["-fps_mode", "cfr"]
+  return [
+    "-f",
+    "concat",
+    "-safe",
+    "0",
+    "-i",
+    listFile,
+    ...(engineIsMT ? ["-threads", "0"] : []),
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0?",
+    "-vf",
+    "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+    ...cfr,
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "18",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "192k",
+    "-af",
+    "aresample=async=1:min_hard_comp=0.100:first_pts=0",
+    "-fflags",
+    "+genpts",
+    "-avoid_negative_ts",
+    "make_zero",
+    "-movflags",
+    "+faststart",
+    "-y",
+    outName,
+  ]
+}
+
+/**
+ * Merge already-written clip files (all present in the WASM FS) into `outName`.
+ *
+ * 1. Probe every clip and pin it to an exact slot on the concat timeline with
+ *    a `duration` directive, so a clip whose audio is a few ms shorter/longer
+ *    than its video can never shift the clips after it.
+ * 2. If all clips share codec/size/fps → stream-copy the video (source quality
+ *    and fps untouched) and only re-anchor the audio.
+ * 3. Verify the result: total length must match the sum of clip durations. If
+ *    the copy path fails or drifts → re-encode merge at source size/fps.
+ *
+ * Returns the merged bytes. Caller owns cleanup of the clip files.
+ */
+export async function mergeClipFilesSynced(
+  ff: FFmpeg,
+  names: string[],
+  listFile: string,
+  outName: string,
+  onStatus?: (message: string) => void,
+): Promise<Uint8Array> {
+  onStatus?.("Checking clip timing before merge...")
+  const probes: ClipProbe[] = []
+  for (const name of names) probes.push(await probeClip(ff, name))
+
+  const listLines: string[] = []
+  let expectedTotal = 0
+  for (let i = 0; i < names.length; i++) {
+    listLines.push(`file '${names[i]}'`)
+    const d = probes[i].durationSec
+    if (d && d > 0) {
+      listLines.push(`duration ${d.toFixed(3)}`)
+      expectedTotal += d
+    }
+  }
+  await ff.writeFile(listFile, new TextEncoder().encode(listLines.join("\n")))
+
+  const first = probes[0]
+  const uniform = probes.every(
+    (p) =>
+      p.videoCodec === first.videoCodec &&
+      p.width === first.width &&
+      p.height === first.height &&
+      (p.fps === null || first.fps === null || Math.abs(p.fps - first.fps) < 0.01),
+  )
+
+  const readOut = async (): Promise<Uint8Array | null> => {
+    try {
+      const data = (await ff.readFile(outName)) as Uint8Array
+      return data.byteLength > 0 ? data : null
+    } catch {
+      return null
+    }
+  }
+
+  if (uniform) {
+    onStatus?.("Merging clips (video copied at source quality, audio re-synced)...")
+    logBuffer = []
+    const ret = await ff.exec(buildSyncedConcatArgs(listFile, outName))
+    if (ret === 0) {
+      const data = await readOut()
+      if (data) {
+        const check = await probeClip(ff, outName)
+        const tol = 0.25 + expectedTotal * 0.01
+        const ok =
+          expectedTotal === 0 || (check.durationSec !== null && Math.abs(check.durationSec - expectedTotal) <= tol)
+        if (ok) return data
+        console.log("[v0] merge verification failed", { got: check.durationSec, expectedTotal })
+      }
+    } else {
+      console.log("[v0] copy merge failed:", logBuffer.slice(-6).join(" | "))
+    }
+    await safeDelete(ff, outName)
+  }
+
+  onStatus?.("Re-encoding merge at source resolution and fps for perfect sync...")
+  logBuffer = []
+  const ret = await ff.exec(buildReencodeConcatArgs(listFile, outName, first.fps))
+  if (ret !== 0) {
+    const tail = logBuffer.slice(-8).join(" | ")
+    throw new Error(`Merging the clips failed.${tail ? ` ffmpeg: ${tail}` : ""}`)
+  }
+  const data = await readOut()
+  if (!data) throw new Error("Merged video came out empty.")
+  return data
+}
 
 function buildCutArgs(mode: PreviewMode, input: string, pair: MappingPair, duration: number, outName: string) {
-  const head = ["-ss", pair.movieStart.toFixed(3), "-i", input, "-t", duration.toFixed(3)]
   if (mode === "fast") {
-    return [
-      ...head,
-      // Only the first video + first audio stream; drop subtitles/data so the
-      // concat step never sees mismatched stream layouts.
-      "-map",
-      "0:v:0",
-      "-map",
-      "0:a:0?",
-      "-sn",
-      "-dn",
-      "-c",
-      "copy",
-      "-avoid_negative_ts",
-      "make_zero",
-      "-y",
-      outName,
-    ]
+    return buildAlignedCopyCutArgs(input, pair.movieStart, duration, outName)
   }
+  const head = ["-ss", pair.movieStart.toFixed(3), "-i", input, "-t", duration.toFixed(3)]
   return [
     ...head,
     // Use every available CPU core when the MT engine is active (4-6x faster
@@ -279,14 +512,19 @@ function buildCutArgs(mode: PreviewMode, input: string, pair: MappingPair, durat
     "0:a:0?",
     "-sn",
     "-dn",
+    // Precise mode = frame-accurate cut ONLY. Keep the source's resolution and
+    // frame rate untouched: no downscale, no fps conversion. The only filter is
+    // an even-dimension snap (required by H.264 yuv420p; a no-op for normal
+    // sources) and the pixel format for universal playback.
     "-vf",
-    `scale=-2:'min(${PREVIEW_MAX_HEIGHT},ih)',scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=24,format=yuv420p`,
+    "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
     "-c:v",
     "libx264",
     "-preset",
-    "ultrafast",
+    "veryfast",
+    // Visually lossless-ish so the re-encode does not soften the picture.
     "-crf",
-    "26",
+    "18",
     // Resample audio against timestamps so voice stays in sync at every cut
     // boundary (prevents drift when clips are concatenated).
     "-af",
@@ -535,43 +773,15 @@ export async function mergeClips(
   const names: string[] = []
 
   try {
-    const listLines: string[] = []
     for (let i = 0; i < clips.length; i++) {
       const clip = clips[i]
       onStatus?.(`Preparing clip ${i + 1} of ${clips.length} for merge...`)
       const name = `clip_${String(clip.index).padStart(3, "0")}.mp4`
       await ff.writeFile(name, clip.data)
       names.push(name)
-      listLines.push(`file '${name}'`)
     }
 
-    onStatus?.("Merging all clips into one video...")
-    await ff.writeFile("concat_list.txt", new TextEncoder().encode(listLines.join("\n")))
-
-    logBuffer = []
-    const ret = await ff.exec([
-      "-f",
-      "concat",
-      "-safe",
-      "0",
-      "-i",
-      "concat_list.txt",
-      "-c",
-      "copy",
-      "-fflags",
-      "+genpts",
-      "-avoid_negative_ts",
-      "make_zero",
-      "-y",
-      "merged.mp4",
-    ])
-    if (ret !== 0) {
-      const tail = logBuffer.slice(-8).join(" | ")
-      throw new Error(`Merging the clips failed.${tail ? ` ffmpeg: ${tail}` : ""}`)
-    }
-
-    const data = (await ff.readFile("merged.mp4")) as Uint8Array
-    if (data.byteLength === 0) throw new Error("Merged video came out empty.")
+    const data = await mergeClipFilesSynced(ff, names, "concat_list.txt", "merged.mp4", onStatus)
     const blob = new Blob([data as BlobPart], { type: "video/mp4" })
     return URL.createObjectURL(blob)
   } catch (err) {
