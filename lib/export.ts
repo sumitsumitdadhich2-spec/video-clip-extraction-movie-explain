@@ -9,7 +9,7 @@
 // - Custom settings → full re-encode with scale / fps / bitrate args.
 
 import type { FFmpeg } from "@ffmpeg/ffmpeg"
-import { getFFmpeg, ensureMovieMounted, toFriendlyError } from "./ffmpeg-client"
+import { getFFmpeg, ensureMovieMounted, toFriendlyError, isMultiThreaded } from "./ffmpeg-client"
 import type { MappingPair } from "./report-parser"
 
 export interface ExportOptions {
@@ -157,6 +157,11 @@ async function runExport(
         outName,
       )
     } else {
+      // Use every available CPU core when the multi-threaded engine is
+      // active (4-6x faster re-encode).
+      if (isMultiThreaded()) {
+        args.push("-threads", "0")
+      }
       args.push(
         "-map",
         "0:v:0",
