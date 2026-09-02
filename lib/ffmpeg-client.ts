@@ -243,10 +243,6 @@ export function getPreviewMode(): PreviewMode {
   return previewMode
 }
 
-// Preview clips in precise mode are capped at 720p — the preview only needs to
-// be watchable, and this keeps encode time and WASM memory small for 4K.
-const PREVIEW_MAX_HEIGHT = 720
-
 /**
  * Stream-copy cut args with A/V starts ALIGNED.
  *
@@ -338,14 +334,19 @@ function buildCutArgs(mode: PreviewMode, input: string, pair: MappingPair, durat
     "0:a:0?",
     "-sn",
     "-dn",
+    // Precise mode = frame-accurate cut ONLY. Keep the source's resolution and
+    // frame rate untouched: no downscale, no fps conversion. The only filter is
+    // an even-dimension snap (required by H.264 yuv420p; a no-op for normal
+    // sources) and the pixel format for universal playback.
     "-vf",
-    `scale=-2:'min(${PREVIEW_MAX_HEIGHT},ih)',scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=24,format=yuv420p`,
+    "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
     "-c:v",
     "libx264",
     "-preset",
-    "ultrafast",
+    "veryfast",
+    // Visually lossless-ish so the re-encode does not soften the picture.
     "-crf",
-    "26",
+    "18",
     // Resample audio against timestamps so voice stays in sync at every cut
     // boundary (prevents drift when clips are concatenated).
     "-af",

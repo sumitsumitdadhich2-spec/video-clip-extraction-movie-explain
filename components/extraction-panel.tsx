@@ -230,7 +230,8 @@ export function ExtractionPanel({ movieFile, pairs, onBack }: ExtractionPanelPro
                   Precise
                 </span>
                 <span className="text-xs leading-relaxed text-slate-400">
-                  Frame-accurate 720p re-encode. Very slow for 4K movies (minutes per clip).
+                  Frame-accurate cuts at the source&apos;s own resolution and frame rate (no downscale, no fps
+                  change). Re-encodes video, so it is slow for 4K movies (minutes per clip).
                 </span>
               </label>
             </div>
