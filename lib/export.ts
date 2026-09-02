@@ -9,7 +9,14 @@
 // - Custom settings → full re-encode with scale / fps / bitrate args.
 
 import type { FFmpeg } from "@ffmpeg/ffmpeg"
-import { getFFmpeg, ensureMovieMounted, toFriendlyError, isMultiThreaded } from "./ffmpeg-client"
+import {
+  getFFmpeg,
+  ensureMovieMounted,
+  toFriendlyError,
+  isMultiThreaded,
+  buildAlignedCopyCutArgs,
+  buildSyncedConcatArgs,
+} from "./ffmpeg-client"
 import type { MappingPair } from "./report-parser"
 
 export interface ExportOptions {
@@ -138,25 +145,15 @@ async function runExport(
       throw new Error(`Clip ${i + 1} (${pair.label}) has an invalid time range.`)
     }
 
-    const args = ["-ss", pair.movieStart.toFixed(3), "-i", exportInput, "-t", duration.toFixed(3)]
+    let args: string[]
 
     if (isOriginal && options.streamCopy) {
-      // Zero re-encode: bit-exact source quality, keyframe-aligned cuts.
-      args.push(
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        "-sn",
-        "-dn",
-        "-c",
-        "copy",
-        "-avoid_negative_ts",
-        "make_zero",
-        "-y",
-        outName,
-      )
+      // Zero re-encode: bit-exact source video, keyframe-aligned cuts with
+      // audio and video starting from the SAME keyframe (no per-clip A/V
+      // offset that would drift after concatenation).
+      args = buildAlignedCopyCutArgs(exportInput, pair.movieStart, duration, outName)
     } else {
+      args = ["-ss", pair.movieStart.toFixed(3), "-i", exportInput, "-t", duration.toFixed(3)]
       // Use every available CPU core when the multi-threaded engine is
       // active (4-6x faster re-encode).
       if (isMultiThreaded()) {
@@ -214,25 +211,10 @@ async function runExport(
     onProgress?.(i + 1, pairs.length)
   }
 
-  onStatus?.("Merging exported clips...")
+  onStatus?.("Merging exported clips (video copied, audio re-synced)...")
   await ff.writeFile("export_concat.txt", new TextEncoder().encode(listLines.join("\n")))
   logs.length = 0
-  const mergeRet = await ff.exec([
-    "-f",
-    "concat",
-    "-safe",
-    "0",
-    "-i",
-    "export_concat.txt",
-    "-c",
-    "copy",
-    "-fflags",
-    "+genpts",
-    "-avoid_negative_ts",
-    "make_zero",
-    "-y",
-    "export_final.mp4",
-  ])
+  const mergeRet = await ff.exec(buildSyncedConcatArgs("export_concat.txt", "export_final.mp4"))
   if (mergeRet !== 0) {
     const tail = logs.slice(-8).join(" | ")
     throw new Error(`Merging the exported clips failed.${tail ? ` ffmpeg: ${tail}` : ""}`)

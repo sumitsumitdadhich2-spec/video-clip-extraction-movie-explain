@@ -247,27 +247,86 @@ export function getPreviewMode(): PreviewMode {
 // be watchable, and this keeps encode time and WASM memory small for 4K.
 const PREVIEW_MAX_HEIGHT = 720
 
+/**
+ * Stream-copy cut args with A/V starts ALIGNED.
+ *
+ * With `-c copy` ffmpeg cannot drop video frames, so video always begins at
+ * the keyframe before `-ss` — but by default it still trims audio exactly at
+ * `-ss`. That leaves every clip with audio starting later than its video.
+ * A single clip plays fine, but once clips are concatenated those per-clip
+ * offsets stack up and the voice drifts. `-noaccurate_seek` makes ffmpeg
+ * keep BOTH streams from the same keyframe, so each clip is internally
+ * consistent and concat can't introduce drift.
+ */
+export function buildAlignedCopyCutArgs(input: string, startSec: number, durationSec: number, outName: string) {
+  return [
+    "-ss",
+    startSec.toFixed(3),
+    "-noaccurate_seek",
+    "-i",
+    input,
+    "-t",
+    durationSec.toFixed(3),
+    // Only the first video + first audio stream; drop subtitles/data so the
+    // concat step never sees mismatched stream layouts.
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0?",
+    "-sn",
+    "-dn",
+    "-c",
+    "copy",
+    "-avoid_negative_ts",
+    "make_zero",
+    "-y",
+    outName,
+  ]
+}
+
+/**
+ * Concat-demuxer merge args that keep voice locked to picture.
+ *
+ * Video is a pure stream copy (zero quality loss, instant). Audio is the ONLY
+ * thing re-packed: `aresample=async=1` re-anchors every audio sample to the
+ * concat timeline, padding/trimming the tiny frame-boundary gaps between
+ * clips that would otherwise accumulate into audible desync. Audio-only
+ * encoding is cheap — a few seconds even for long outputs.
+ */
+export function buildSyncedConcatArgs(listFile: string, outName: string) {
+  return [
+    "-f",
+    "concat",
+    "-safe",
+    "0",
+    "-i",
+    listFile,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a:0?",
+    "-c:v",
+    "copy",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "192k",
+    "-af",
+    "aresample=async=1:min_hard_comp=0.100:first_pts=0",
+    "-fflags",
+    "+genpts",
+    "-avoid_negative_ts",
+    "make_zero",
+    "-y",
+    outName,
+  ]
+}
+
 function buildCutArgs(mode: PreviewMode, input: string, pair: MappingPair, duration: number, outName: string) {
-  const head = ["-ss", pair.movieStart.toFixed(3), "-i", input, "-t", duration.toFixed(3)]
   if (mode === "fast") {
-    return [
-      ...head,
-      // Only the first video + first audio stream; drop subtitles/data so the
-      // concat step never sees mismatched stream layouts.
-      "-map",
-      "0:v:0",
-      "-map",
-      "0:a:0?",
-      "-sn",
-      "-dn",
-      "-c",
-      "copy",
-      "-avoid_negative_ts",
-      "make_zero",
-      "-y",
-      outName,
-    ]
+    return buildAlignedCopyCutArgs(input, pair.movieStart, duration, outName)
   }
+  const head = ["-ss", pair.movieStart.toFixed(3), "-i", input, "-t", duration.toFixed(3)]
   return [
     ...head,
     // Use every available CPU core when the MT engine is active (4-6x faster
@@ -545,26 +604,11 @@ export async function mergeClips(
       listLines.push(`file '${name}'`)
     }
 
-    onStatus?.("Merging all clips into one video...")
+    onStatus?.("Merging all clips into one video (video copied, audio re-synced)...")
     await ff.writeFile("concat_list.txt", new TextEncoder().encode(listLines.join("\n")))
 
     logBuffer = []
-    const ret = await ff.exec([
-      "-f",
-      "concat",
-      "-safe",
-      "0",
-      "-i",
-      "concat_list.txt",
-      "-c",
-      "copy",
-      "-fflags",
-      "+genpts",
-      "-avoid_negative_ts",
-      "make_zero",
-      "-y",
-      "merged.mp4",
-    ])
+    const ret = await ff.exec(buildSyncedConcatArgs("concat_list.txt", "merged.mp4"))
     if (ret !== 0) {
       const tail = logBuffer.slice(-8).join(" | ")
       throw new Error(`Merging the clips failed.${tail ? ` ffmpeg: ${tail}` : ""}`)
