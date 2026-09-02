@@ -15,7 +15,7 @@ import {
   toFriendlyError,
   isMultiThreaded,
   buildAlignedCopyCutArgs,
-  buildSyncedConcatArgs,
+  mergeClipFilesSynced,
 } from "./ffmpeg-client"
 import type { MappingPair } from "./report-parser"
 
@@ -133,7 +133,7 @@ async function runExport(
   }
   filters.push("format=yuv420p")
 
-  const listLines: string[] = []
+  const clipNames: string[] = []
 
   for (let i = 0; i < pairs.length; i++) {
     const pair = pairs[i]
@@ -207,21 +207,11 @@ async function runExport(
       const tail = logs.slice(-8).join(" | ")
       throw new Error(`Failed to export clip ${i + 1} (${pair.label}).${tail ? ` ffmpeg: ${tail}` : ""}`)
     }
-    listLines.push(`file '${outName}'`)
+    clipNames.push(outName)
     onProgress?.(i + 1, pairs.length)
   }
 
-  onStatus?.("Merging exported clips (video copied, audio re-synced)...")
-  await ff.writeFile("export_concat.txt", new TextEncoder().encode(listLines.join("\n")))
-  logs.length = 0
-  const mergeRet = await ff.exec(buildSyncedConcatArgs("export_concat.txt", "export_final.mp4"))
-  if (mergeRet !== 0) {
-    const tail = logs.slice(-8).join(" | ")
-    throw new Error(`Merging the exported clips failed.${tail ? ` ffmpeg: ${tail}` : ""}`)
-  }
-
-  const data = (await ff.readFile("export_final.mp4")) as Uint8Array
-  if (data.byteLength === 0) throw new Error("Exported video came out empty.")
+  const data = await mergeClipFilesSynced(ff, clipNames, "export_concat.txt", "export_final.mp4", onStatus)
   const blob = new Blob([data as BlobPart], { type: "video/mp4" })
 
   onStatus?.("Export complete.")
