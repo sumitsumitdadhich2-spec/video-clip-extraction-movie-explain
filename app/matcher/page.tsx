@@ -26,8 +26,10 @@ export default function Page() {
     setVerdict(report.verdict)
     // Movie-only mode (no short): skip compare, go straight to cut & merge.
     setStep(short ? "compare" : "export")
-    // Kick off background cutting of movie clips right away.
-    startBackgroundExtraction(movie, report.pairs)
+    // Background cutting only makes sense while the user is busy on the Compare
+    // step (Short + Movie). In movie-only mode the user lands directly on Merge,
+    // so clips are cut once when they press "Merge Clips" — no wasted CPU.
+    if (short) startBackgroundExtraction(movie, report.pairs)
   }
 
   const handleRestart = () => {
@@ -141,6 +143,7 @@ export default function Page() {
             <ExtractionPanel
               movieFile={movieFile}
               pairs={pairs}
+              preCutInBackground={Boolean(shortFile)}
               onBack={() => (shortFile ? setStep("compare") : handleRestart())}
             />
           )}
